@@ -156,7 +156,7 @@ see the others, and options are eliminated head to head until one is left.
 |---|---|
 | **Judges are blind to identity.** | A judge sees "Candidate 0" and "Candidate 1", never the option name, so it cannot pick on brand over merit. The two are presented in an order seeded by their own contents, so a first-position bias cannot win every match by default — and seeding it means the cache does not freeze whichever order ran first. |
 | **Single elimination, not round robin.** | 4 options cost 7 agents: 4 advocates + 3 judges. Round robin would spend 6 judges on the same field. |
-| **An undecided matchup advances both.** | A dead judge must not eliminate a contender — that is a result nobody voted for, and the champion would inherit a field that shrank for no stated reason. The run reports the winner as provisional and exits non-zero. |
+| **An undecided matchup advances both.** | A dead judge must not eliminate a contender — that is a result nobody voted for, and the champion would inherit a field that shrank for no stated reason. When a whole round decides nothing, the remaining options are a tie and there is no winner at all. Either way the command exits non-zero. |
 
 ## Measured
 
@@ -246,9 +246,12 @@ These are the rules the tests exist to protect. Each one is a bug that shipped.
   advocate died is reported as `no_case` and excluded — it did not lose the
   tournament, it never entered it, and a bracket that quietly drops a branch
   hands the crown to a smaller field than the user asked about.
-- **A dead judge eliminates nobody.** Both contenders advance and the winner
-  is reported provisional. Picking one anyway is an elimination no agent voted
-  for.
+- **A dead judge eliminates nobody — until nobody can be eliminated.** Both
+  contenders advance, and the winner is reported provisional. But a round that
+  decides *no* matchup does not shrink the field, so the bracket stops there:
+  the remaining options are a tie and the run says so. Looping on it is not
+  patience, it is 100k judge calls and no answer. (Shipped: a dead judge in a
+  2-option field re-ran the same matchup forever.)
 - **A judge votes on position, not identity.** `winner: [0, 1]` indexes the
   order the *prompt* presented, which is seeded by the options' own contents so
   position bias cannot become a deterministic win rate across a cached rerun.
@@ -279,7 +282,7 @@ owner:
 | `test_review.py` | the review example — batching, dedup, dead-run guards |
 | `test_research.py` | the research example — sweep blindness, citation checking |
 | `test_upgrade.py` | the upgrade example — runtime fan-out width, budget capping, refutation |
-| `test_decide.py` | the decide example — bracket cost, dead judges, presented-vs-argument order |
+| `test_decide.py` | the decide example — bracket cost, dead judges, the no-progress guard, `--max`, presented-vs-argument order |
 | `conftest.py` | the shared fakes (`patched`, `message`, `FINDING`) |
 
 To decide whether a test earns its place, break the thing it covers and check

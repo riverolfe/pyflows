@@ -112,11 +112,16 @@ async def decide(question: str, options: list[str], spend: _Spend | None = None)
     )
 
     # An option whose advocate died did not lose the tournament, it never
-    # played. Different thing, and the difference is the whole point.
-    contenders: list[dict[str, Any]] = [
-        {"option": o, "case": c} for o, c in zip(options, cases, strict=True) if c
-    ]
-    no_case = [o for o, c in zip(options, cases, strict=True) if not c]
+    # played. Different thing, and the difference is the whole point. One pass:
+    # two traversals of the same zip can drift apart the moment either filter
+    # gains a clause.
+    contenders: list[dict[str, Any]] = []
+    no_case: list[str] = []
+    for option, case in zip(options, cases, strict=True):
+        if case:
+            contenders.append({"option": option, "case": case})
+        else:
+            no_case.append(option)
     if no_case:
         print(f"  {len(no_case)} option(s) got no case and cannot compete: {', '.join(no_case)}")
     if len(contenders) < 2:
@@ -127,59 +132,74 @@ async def decide(question: str, options: list[str], spend: _Spend | None = None)
     rounds: list[dict] = []
     undecided = 0
     while len(contenders) > 1:
-        matchups = [contenders[i : i + 2] for i in range(0, len(contenders), 2)]
-        shown = [_order(*m) for m in matchups if len(m) == 2]
+        # (matchup, presentation order) built once: the judge reads `shown`
+        # and its index comes back against the same pair. Recomputing the order
+        # at verdict time makes the binding depend on _order staying pure.
+        games = [(_order(*m) if len(m) == 2 else None, m) for m in _matchups(contenders)]
+        shown = [pair for pair, _ in games if pair is not None]
 
-        verdicts = await gather(
-            [
-                ask(
-                    f"{question}\n\nPick the stronger of these two plans.\n\n"
-                    + "\n\n".join(
-                        f"[{i}] {c['option']}\n    Plan: {c['case']['plan']}\n"
-                        f"    Weakest point: {c['case']['caveat']}"
-                        for i, c in enumerate(pair)
+        verdicts = iter(
+            await gather(
+                [
+                    ask(
+                        f"{question}\n\nPick the stronger of these two plans.\n\n"
+                        + "\n\n".join(
+                            f"[{i}] {c['option']}\n    Plan: {c['case']['plan']}\n"
+                            f"    Weakest point: {c['case']['caveat']}"
+                            for i, c in enumerate(pair)
+                        )
+                        + "\n\nJudge on merit, not on which is written first. Pick "
+                        'one — "both are fine" is not a verdict you can return. '
+                        "Return the index of the better plan.",
+                        PAIR,
+                        spend=spend,
+                        # Only the panel truncates; truncating here would let two
+                        # options sharing a prefix collapse into one label, and
+                        # panel pairs by label.
+                        label=f"judge/{pair[0]['option']}"[:32],
+                        system="You are an impartial judge. One winner or nothing.",
                     )
-                    + "\n\nJudge on merit, not on which is written first. Pick "
-                    'one — "both are fine" is not a verdict you can return. '
-                    "Return the index of the better plan.",
-                    PAIR,
-                    spend=spend,
-                    label=f"judge/{pair[0]['option'][:12]}"[:32],
-                    system="You are an impartial judge. One winner or nothing.",
-                )
-                for pair in shown
-            ]
+                    for pair in shown
+                ]
+            )
         )
 
-        verdicts = iter(verdicts)
         nxt = []
-        for m in matchups:
-            if len(m) == 1:
+        for pair, m in games:
+            if pair is None:
                 nxt.append(m[0])  # bye
                 continue
-            pair = _order(*m)
             verdict = next(verdicts)
             if verdict is None:
-                # Dead judge. Advancing both keeps the bracket honest and the
-                # count honest; picking one would be an elimination nobody
-                # voted for, and the winner would inherit a decided field.
+                # Dead judge. Advancing both keeps the bracket honest: picking
+                # one would be an elimination nobody voted for.
                 undecided += 1
                 rounds.append({"match": [c["option"] for c in pair], "outcome": "undecided"})
                 nxt.extend(m)
                 continue
-            winner, loser = (pair[0], pair[1]) if verdict["winner"] == 0 else (pair[1], pair[0])
+            nxt.append(pair[verdict["winner"]])
             rounds.append(
                 {"match": [c["option"] for c in pair], "outcome": "winner", "why": verdict["why"]}
             )
-            nxt.append(winner)
-            loser["eliminated_by"] = winner["option"]
+        # A round that eliminates nobody does not shrink the field, so the
+        # bracket would re-run the same matchups forever. That is not "both
+        # advance, carry on" — it is a tournament that cannot be resolved, and
+        # the honest result is no result.
+        if len(nxt) >= len(contenders):
+            print(f"  no matchup could be decided; {len(contenders)} options remain tied")
+            break
         contenders = nxt
 
-    champion = contenders[0]
+    tied = [c["option"] for c in contenders]
     return {
         "question": question,
         "options": options,
-        "winner": {"option": champion["option"], "plan": champion["case"]["plan"]},
+        # None when the bracket stalled — a provisional winner is still a lie,
+        # and this is the case where there is nothing to be provisional about.
+        "winner": None
+        if len(tied) > 1
+        else {"option": tied[0], "plan": contenders[0]["case"]["plan"]},
+        "tied": tied if len(tied) > 1 else [],
         "rounds": rounds,
         "no_case": no_case,
         # The winner is provisional whenever a judge died: the bracket above it
@@ -189,9 +209,16 @@ async def decide(question: str, options: list[str], spend: _Spend | None = None)
     }
 
 
+def _matchups(contenders: list[dict]) -> list[list[dict]]:
+    return [contenders[i : i + 2] for i in range(0, len(contenders), 2)]
+
+
 def render(brief: dict) -> None:
     print(f"\n{brief['question']}")
-    print(f"\nbest option: {brief['winner']['option']}\n  {brief['winner']['plan']}")
+    if brief["winner"] is None:
+        print(f"\nno winner: {', '.join(brief['tied'])} could not be separated")
+    else:
+        print(f"\nbest option: {brief['winner']['option']}\n  {brief['winner']['plan']}")
 
     print("\nrounds:")
     for r in brief["rounds"]:
@@ -201,13 +228,11 @@ def render(brief: dict) -> None:
         else:
             print(f"  {a}  beats  {b}\n    {r['why']}")
 
-    if brief["undecided"]:
+    if brief["undecided"] and brief["winner"] is not None:
         print(
             f"\n{brief['undecided']} matchup(s) went undecided — the winner is "
             f"provisional, not chosen."
         )
-    if brief["no_case"]:
-        print(f"{len(brief['no_case'])} option(s) never competed: {', '.join(brief['no_case'])}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -226,6 +251,12 @@ def main(argv: list[str] | None = None) -> int:
     if len(options) < 2:
         print("need at least two distinct options")
         return 1
+    # `is not None`, not truthiness: --max 0 is a request for an empty field,
+    # and a negative one slices options off the end. Both are user error worth
+    # naming rather than a field they did not ask for.
+    if args.max is not None and args.max < 2:
+        print(f"--max {args.max} leaves no tournament; it needs at least 2")
+        return 1
 
     # n advocates + (n-1) judges. Say so when the budget cannot hold the field,
     # the way upgrade() does — a tournament that quietly enters 5 of 12 options
@@ -233,9 +264,10 @@ def main(argv: list[str] | None = None) -> int:
     capped = ""
     field = options
     spend = _Spend(MAX_CALLS)
-    if args.max:
+    if args.max is not None:
         field = options[: args.max]
-        capped = f" (capped from {len(options)})"
+        if len(field) < len(options):
+            capped = f" (capped from {len(options)})"
     elif len(options) * 2 - 1 > spend.remaining:
         field = options[: (spend.remaining + 1) // 2]
         capped = f" — only {len(field)}/{len(options)} fit the budget"
@@ -250,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
             "lenses": len(field),
         }
     )
-    print(f"{len(field)} options{capped}")
+    print(f"{len(field)} option{'s' if len(field) != 1 else ''}{capped}")
 
     try:
         brief = asyncio.run(decide(args.question, field, spend))
@@ -261,9 +293,10 @@ def main(argv: list[str] | None = None) -> int:
     render(brief)
     print(f"\n{STATS.summary()}")
     print(f"wall clock: {time.monotonic() - started:.0f}s")
-    # A provisional winner is not a decision, and an option that never played
-    # is not a loss. Same rule upgrade() follows over unchecked dependencies.
-    return 1 if brief["undecided"] or brief["no_case"] else 0
+    # A provisional winner is not a decision, an option that never played is
+    # not a loss, and a field that never got entered is not a field. Same rule
+    # upgrade() follows over unchecked dependencies.
+    return 1 if brief["undecided"] or brief["no_case"] or brief["winner"] is None or capped else 0
 
 
 if __name__ == "__main__":
