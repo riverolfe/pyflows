@@ -68,10 +68,11 @@ def _stage_rows(run: list[dict]) -> list[tuple[str, str, str, str, str]]:
 def _render(run: list[dict]) -> str:
     start = run[0] if run else {}
     mode = start.get("mode", "full")
-    # Research fans out over search angles; review over code lenses. Same
-    # field, different word — calling angles "lenses" reads as a bug.
+    # Research fans out over search angles; review over code lenses; decide
+    # over a bracket field. Same field, different word — calling angles
+    # "lenses" reads as a bug.
     count = start.get("lenses", "?")
-    noun = {"research": "angle", "quick": "lens"}.get(mode, "lens")
+    noun = {"research": "angle", "quick": "lens", "decide": "option"}.get(mode, "lens")
     if count != 1:
         noun += "s"
     target = start.get("target", "?")
