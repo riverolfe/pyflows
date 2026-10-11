@@ -65,7 +65,9 @@ def test_cache_key_separates_every_input_it_is_built_from():
     base = ("p", {"t": 1}, ("Read",))
     assert cache_key(*base, "", ".", "sig") != cache_key(*base, "", ".", "other")
     assert cache_key(*base, "", ".", "sig") != cache_key(*base, "", ".")
-    assert cache_key(*base, "", "a") != cache_key(*base, "", "b")
+    # Named, not positional: the two calls below differ only in cwd, which
+    # reads as the same call written twice.
+    assert cache_key(*base, system="", cwd="a") != cache_key(*base, system="", cwd="b")
     # A system prompt merged into tools collided with another tools tuple.
     assert cache_key(*base, "") != cache_key("p", {"t": 1}, ("", "Read"))
     assert cache_key("p", {"t": 1}, ("Read",), "s1") != cache_key("p", {"t": 1}, ("Read",), "s2")
