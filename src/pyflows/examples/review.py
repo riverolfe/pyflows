@@ -46,15 +46,6 @@ FINDINGS = {
     "required": ["findings"],
 }
 
-VERDICT = {
-    "type": "object",
-    "properties": {
-        "refuted": {"type": "boolean"},
-        "reason": {"type": "string"},
-    },
-    "required": ["refuted", "reason"],
-}
-
 # One agent judges a BATCH of findings. Reading the source dominates the cost,
 # so judging 5 in one call is far cheaper than 5 calls that each re-read it.
 BATCH = {
