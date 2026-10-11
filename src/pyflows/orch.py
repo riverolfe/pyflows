@@ -187,6 +187,10 @@ SKIP_DIRS = frozenset(
         ".next",
         ".nuxt",
         "coverage",
+        # A sibling worktree's source is not the tree under review. Left in,
+        # .worktrees/unit-01 lands inside unit-02's fingerprint and a fan-out
+        # over worktrees caches a result computed against another unit's code.
+        ".worktrees",
     }
 )
 
