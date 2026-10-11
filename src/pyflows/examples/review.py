@@ -227,7 +227,10 @@ def main(argv: list[str] | None = None) -> int:
         from .decide import main as decide_main
 
         return decide_main(
-            [args.question, *args.options] + (["--max", str(args.max)] if args.max else [])
+            [args.question, *args.options]
+            # is not None: --max 0 is a request, and dropping it silently
+            # runs a bigger tournament than the user asked for.
+            + (["--max", str(args.max)] if args.max is not None else [])
         )
     if args.command == "agents":
         return show_agents(args.last, as_json=args.json)

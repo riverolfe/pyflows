@@ -80,15 +80,41 @@ def test_a_tournament_needs_two_options():
 
 def test_a_dead_judge_advances_both_instead_of_eliminating_one():
     # Picking a winner the judge never gave is an elimination nobody voted
-    # for, and the champion inherits a field that shrank for no stated reason.
+    # for. A 4-option field keeps shrinking via the other matchup, so the run
+    # still finishes — with a provisional winner.
     fake, _ = _tournament(dead_judges={0})
     with patched(dc, "ask", fake):
-        brief = asyncio.run(dc.decide("which db?", ["postgres", "mysql", "sqlite"]))
+        brief = asyncio.run(dc.decide("which db?", ["postgres", "mysql", "redis", "sqlite"]))
 
     assert brief["undecided"] == 1
     assert brief["rounds"][0]["outcome"] == "undecided"
     # Both advanced: the undecided match is the two that were on the floor.
     assert set(brief["rounds"][0]["match"]) == {"postgres", "mysql"}
+    assert brief["winner"] is not None
+
+
+def test_a_round_that_eliminates_nobody_ends_the_bracket_in_a_draw():
+    # Both-advance is right for one matchup, but a round where nothing was
+    # decided does not shrink the field — looping on it re-runs the same
+    # matchups forever. Measured: 104k judge calls with no termination.
+    fake, _ = _tournament(dead_judges={0})
+    with patched(dc, "ask", fake):
+        brief = asyncio.run(dc.decide("which db?", ["postgres", "mysql"]))
+
+    assert brief["undecided"] == 1
+    assert brief["winner"] is None
+    assert set(brief["tied"]) == {"postgres", "mysql"}
+
+
+def test_a_field_where_no_judge_ever_answers_terminates():
+    fake, prompts = _tournament(dead_judges={0, 1, 2, 3, 4, 5, 6, 7, 8, 9})
+    with patched(dc, "ask", fake):
+        brief = asyncio.run(dc.decide("which db?", ["a", "b", "c", "d"]))
+
+    assert brief["winner"] is None
+    assert len(brief["tied"]) == 4
+    # One round, then it stops — not one round per option, not forever.
+    assert len([p for p in prompts if "Pick the stronger" in p]) == 2
 
 
 def test_single_elimination_costs_one_judge_per_match_not_a_round_robin():
@@ -131,3 +157,35 @@ def test_a_judge_that_names_an_out_of_range_candidate_fails_validation():
     for bad in (2, -1):
         with pytest.raises(jsonschema.ValidationError):
             jsonschema.validate({"winner": bad, "why": "the third one"}, dc.PAIR)
+
+
+# ------------------------------------------------------------------- the CLI
+
+
+def test_a_cap_that_would_leave_no_tournament_is_refused(capsys):
+    # --max 0 is falsy, so a truthiness test runs the FULL field instead of the
+    # empty one asked for; --max -1 slices the last option off the end. Neither
+    # is a tournament the user meant to enter.
+    for bad in ("0", "-1", "-2"):
+        assert dc.main(["which?", "a", "b", "--max", bad]) == 1
+    assert "needs at least 2" in capsys.readouterr().out
+
+
+def test_a_field_that_never_got_entered_is_not_a_clean_run(capsys):
+    # The comment above the cap names this as the lie to avoid, and upgrade()
+    # honours the same rule. 4 options with --max 2 enters half the field; a
+    # winner from 2 of 4 is not a decision between 4.
+    fake, _ = _tournament()
+    with patched(dc, "ask", fake):
+        code = dc.main(["which?", "a", "b", "c", "d", "--max", "2"])
+    assert code == 1
+    assert "capped from 4" in capsys.readouterr().out
+
+
+def test_a_cap_above_the_field_size_does_not_claim_a_truncation(capsys):
+    # options[:99] drops nothing; saying "capped from 2" asserts an edit that
+    # never happened.
+    fake, _ = _tournament()
+    with patched(dc, "ask", fake):
+        assert dc.main(["which?", "a", "b", "--max", "99"]) == 0
+    assert "capped" not in capsys.readouterr().out
