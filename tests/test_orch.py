@@ -117,6 +117,21 @@ def test_stat_signature_ignores_dependency_and_build_directories(tmp_path):
     assert stat_signature(tmp_path) == before
 
 
+def test_stat_signature_ignores_a_sibling_worktree(tmp_path):
+    # A `git worktree add .worktrees/unit-01` inside the repo puts a second
+    # copy of the source under the review root. Fingerprinted, unit-01's code
+    # lands in unit-02's cache key and the fan-out caches a result computed
+    # against another unit's tree — green, and stale.
+    (tmp_path / "unit.py").write_text("x = 1\n")
+    before = stat_signature(tmp_path)
+
+    unit = tmp_path / ".worktrees" / "unit-01"
+    unit.mkdir(parents=True)
+    (unit / "unit.py").write_text("x = 1\n")
+    (unit / "only_here.py").write_text("y = 1\n")
+    assert stat_signature(tmp_path) == before
+
+
 def test_stat_signature_prunes_on_the_relative_path_not_the_absolute_one(tmp_path):
     # The repo under test may itself live at .../build/. Skipping any path
     # containing a skipped dir name would fingerprint it as empty.
