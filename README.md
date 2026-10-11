@@ -172,6 +172,11 @@ Batching alone took the full run from 16 agents / 0.82M / 708s to 7 / 0.29M /
 
 Research, 3 angles + synthesis + 2 citations: 6 agents, 0.30M, 193s.
 
+Decide, 4 options — 4 advocates + 3 judges: 7 agents, 0.19M, 151s wall clock
+across 538s of API time. The cheapest of the four, because no agent reads a
+repo: it is the only example that costs nothing to re-run over a tree that
+hasn't changed, since nothing in its cache key depends on one.
+
 ## How it works
 
 Two framework modules and four examples:
@@ -231,7 +236,11 @@ These are the rules the tests exist to protect. Each one is a bug that shipped.
   since a pipeline is code with the same review needs — and skips
   `node_modules`, `dist`, `target` and friends. Defaulting to `.py` alone
   meant every non-Python repo fingerprinted to the same empty hash: two TS
-  repos collided, and edits never invalidated.
+  repos collided, and edits never invalidated. `.worktrees` is in that list
+  because `git worktree add .worktrees/unit-01` puts a second copy of the
+  source under the review root: fingerprinted, one unit's code lands in
+  another unit's cache key and a fan-out caches a result computed against
+  the wrong tree — green, and stale.
 - **Agents are confined.** `cwd` plus `disallowed_tools`. Not a jail — `Read`
   still takes absolute paths. For a real boundary use `can_use_tool`.
 - **Batched verdicts are paired by occurrence, not by label.** Labels repeat;
@@ -277,7 +286,7 @@ owner:
 
 | file | covers |
 |---|---|
-| `test_orch.py` | `ask`, `gather`, both budget ceilings, the cache key, `STATS` |
+| `test_orch.py` | `ask`, `gather`, both budget ceilings, the cache key and its fingerprint, `STATS` |
 | `test_panel.py` | run-log rendering — row pairing, truncation, the outcome table |
 | `test_review.py` | the review example — batching, dedup, dead-run guards |
 | `test_research.py` | the research example — sweep blindness, citation checking |
