@@ -49,15 +49,18 @@ pyflows upgrade .                # what would upgrading this repo's deps break?
 pyflows upgrade . --limit 5      # audit the 5 highest-blast-radius dependencies
 pyflows upgrade . --depth 5      # verify 5 candidate breaks instead of 3
 
+pyflows decide "which queue?" redis rabbitmq kafka   # pick by tournament
+pyflows decide "q" "a" "b" --max 4  # enter only the first 4 options
+
 pyflows agents -n 3             # browse past runs
 pyflows agents --json           # raw records
 pyflows watch                   # live panel while a run is in flight
 ```
 
-Both commands exit non-zero when the run did not complete — a dead run never
+Every command exits non-zero when the run did not complete — a dead run never
 reports "clean".
 
-## Three example workflows
+## Four example workflows
 
 All live in `src/pyflows/examples/` — they are examples of the framework, not
 part of it. Everything they use lives in `orch.py` and `panel.py`.
@@ -65,6 +68,14 @@ part of it. Everything they use lives in `orch.py` and `panel.py`.
 **`review`** — find → dedup → refute. Four lenses read the same tree
 independently; findings are deduplicated; one agent per batch tries to *refute*
 each survivor. Cheap: a cached re-run costs nothing.
+
+```
+                    ┌ correctness ────┐
+                    ├ security ───────┤
+   src ────────────▶├ performance ─────┼──▶ ▓▓ barrier ▓▓ ──▶ dedupe ──▶ 5/agent ──▶ confirmed
+                    ├ error-handling ──┤     all 4 lenses in
+                    └──────────────────┘
+```
 
 **`research`** — sweep → synthesize → verify. The four angles are different
 *modalities*, not keyword variants, and each is blind to the others:
@@ -78,6 +89,13 @@ each survivor. Cheap: a cached re-run costs nothing.
 
 A searcher given a reworded query finds what the first one found. A searcher
 given a different modality finds what a keyword variant can't.
+
+```
+                    ┌ primary ────────┐
+   question ───────▶├ practitioner ───┼──▶ ▓▓ barrier ▓▓ ──▶ synthesize ──▶ citations ──▶ brief
+                    ├ contrarian ─────┤        4 angles in
+                    └ recent ─────────┘
+```
 
 The synthesizer is told to **report contradictions rather than resolve them** —
 handed thirty claims it will otherwise average them into one confident answer.
@@ -94,11 +112,51 @@ manifest, then one agent per dependency asks what upgrading it would break
 | **The fan-out width is discovered, not declared.** | `review` fans out over a fixed lens tuple, `research` over a fixed angle tuple. Here stage one returns the dependency list and *that* decides how many agents run — the first case where the call count isn't known before the run starts, and the reason `MAX_CALLS` is a real constraint rather than a formality. When the budget can't cover everything found, it says so rather than quietly auditing a prefix. |
 | **Every agent is a diff against this repo.** | An agent that only knew "Django 5.0 removed `django.utils.timezone.utc`" would report a break on a repo that never used it. Each agent holds both the repo and the web, and is told that an empty findings array is the common, correct answer. |
 
+```
+                    ┌ inventory ──────┐
+   target ─────────▶│ N deps, found  │──▶ the N below is not known before the run starts
+                    └─────────────────┘
+                              │
+             ┌────────────────┼────────────────┐
+             ▼                ▼                ▼
+        dep/django ──▶ dep/requests ──▶ dep/attrs ──▶ …        N agents, blind to
+             │                │                │            each other, repo + web
+             └────────────────┴────────────────┘
+                              │
+                              ▼
+                     ▓▓ barrier ▓▓ ──▶ dedupe ──▶ 5/agent ──▶ confirmed brief
+```
+
 Dependencies are ranked direct-first then by how many places use them, so a
 truncated audit spends its budget where the blast radius is. Each agent must
 also report the changelogs it actually read: an agent whose web tools fail can
 still return a schema-valid "no breaks", and without that field an unreachable
 dependency is indistinguishable from a safe one.
+
+**`decide`** — advocate → bracket → winner. The one that is not a pipeline.
+The others fan out, hit a barrier, then fan out again; this is a knockout
+bracket, where each verdict decides who plays next.
+
+```
+   question ──▶ case/a ─┐
+                case/b ─┴──▶ judge ──▶ W1 ─┐
+                case/c ─┐                  ├──▶ final ──▶ winner
+                case/d ─┴──▶ judge ──▶ W2 ─┘
+```
+
+Four options: two judges in round one, one in the final. An odd field gives the
+last option a bye into the next round.
+
+The other three all have a correct answer to check a finding against, so they
+verify. "Which should we use?" has none — a single confident answer is one
+agent's preference wearing a suit. So every option gets an advocate who cannot
+see the others, and options are eliminated head to head until one is left.
+
+| | |
+|---|---|
+| **Judges are blind to identity.** | A judge sees "Candidate 0" and "Candidate 1", never the option name, so it cannot pick on brand over merit. The two are presented in an order seeded by their own contents, so a first-position bias cannot win every match by default — and seeding it means the cache does not freeze whichever order ran first. |
+| **Single elimination, not round robin.** | 4 options cost 7 agents: 4 advocates + 3 judges. Round robin would spend 6 judges on the same field. |
+| **An undecided matchup advances both.** | A dead judge must not eliminate a contender — that is a result nobody voted for, and the champion would inherit a field that shrank for no stated reason. The run reports the winner as provisional and exits non-zero. |
 
 ## Measured
 
@@ -116,7 +174,7 @@ Research, 3 angles + synthesis + 2 citations: 6 agents, 0.30M, 193s.
 
 ## How it works
 
-Two framework modules and three examples:
+Two framework modules and four examples:
 
 | | |
 |---|---|
@@ -125,13 +183,18 @@ Two framework modules and three examples:
 | `examples/review.py` | find → dedup → refute, plus the CLI dispatcher (it is the workflow that dispatches to) |
 | `examples/research.py` | sweep → synthesize → verify |
 | `examples/upgrade.py` | inventory → sweep → verify. The fan-out width is discovered at runtime |
+| `examples/decide.py` | advocate → bracket → winner. A dataflow, not a pipeline |
 
 The examples share the framework and nothing else. That is deliberate: the shape
-of a code review, a research sweep and a dependency audit have little in common
-beyond the transport, and each new one has been what proved it. **Add a fourth
-workflow next to them in `examples/`; add abstractions when it asks for them,
-not before.** `orch.py` gained nothing from the third — the runtime fan-out
-just meant calling `gather()` on a list whose length came from stage one.
+of a code review, a research sweep, a dependency audit and a knockout bracket
+have little in common beyond the transport, and each new one has been what
+proved it. **Add a fifth workflow next to them in `examples/`; add abstractions
+when it asks for them, not before.** `orch.py` gained nothing from the third —
+the runtime fan-out just meant calling `gather()` on a list whose length came
+from stage one — and nothing from the fourth: a bracket is a `while` loop around
+`gather()`. The two things the tournament needed and did *not* find in the
+framework were a per-matchup decision (which is the pattern) and a way to keep
+a judge from picking on position (which is one `zlib.crc32` sort).
 
 Two ceilings, not one: `_Spend` bounds *calls* across a run, `max_budget_usd`
 bounds *dollars* within a call. The second catches the runaway single agent the
@@ -179,6 +242,17 @@ These are the rules the tests exist to protect. Each one is a bug that shipped.
   nothing, which costs an agent per source and learns nothing.
 - **Sweep agents stay blind to each other.** A searcher that saw the others'
   claims would echo them back instead of finding what they missed.
+- **An advocate that lost its agent never played.** A `decide` option whose
+  advocate died is reported as `no_case` and excluded — it did not lose the
+  tournament, it never entered it, and a bracket that quietly drops a branch
+  hands the crown to a smaller field than the user asked about.
+- **A dead judge eliminates nobody.** Both contenders advance and the winner
+  is reported provisional. Picking one anyway is an elimination no agent voted
+  for.
+- **A judge votes on position, not identity.** `winner: [0, 1]` indexes the
+  order the *prompt* presented, which is seeded by the options' own contents so
+  position bias cannot become a deterministic win rate across a cached rerun.
+  Keying on the argument order instead swaps the two options the judge saw.
 
 ## Environment
 
@@ -205,6 +279,7 @@ owner:
 | `test_review.py` | the review example — batching, dedup, dead-run guards |
 | `test_research.py` | the research example — sweep blindness, citation checking |
 | `test_upgrade.py` | the upgrade example — runtime fan-out width, budget capping, refutation |
+| `test_decide.py` | the decide example — bracket cost, dead judges, presented-vs-argument order |
 | `conftest.py` | the shared fakes (`patched`, `message`, `FINDING`) |
 
 To decide whether a test earns its place, break the thing it covers and check
@@ -241,6 +316,10 @@ run `pytest`, which uses fakes.
   one refutation attempt rather than four opinions disagreeing.
 - Research verification checks the first `--depth` sources, which is an
   arbitrary prefix, not the most load-bearing ones. Pick by hand for now.
+- `decide` advocates run with no tools. They argue from the question, they do
+  not go read the repo, so "which library should we use?" is decided on what the
+  question says rather than on what this codebase actually does. Put the
+  relevant facts in the question, or pass the repo's context in it.
 - Stage labels are unique by convention, not by construction. If a workflow
   ever emits two agents sharing a label, the panel merges them again — the run
   log keeps both records, only the display does.

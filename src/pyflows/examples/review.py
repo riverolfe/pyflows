@@ -216,8 +216,19 @@ def main(argv: list[str] | None = None) -> int:
     up.add_argument("--depth", type=int, default=3, help="candidate breaks to verify")
     up.add_argument("--no-verify", action="store_true", help="skip verification")
 
+    dc = sub.add_parser("decide", help="pick between options by tournament")
+    dc.add_argument("question")
+    dc.add_argument("options", nargs="+", help="two or more options to choose between")
+    dc.add_argument("--max", type=int, default=None, help="cap the field size")
+
     args = parser.parse_args(argv)
 
+    if args.command == "decide":
+        from .decide import main as decide_main
+
+        return decide_main(
+            [args.question, *args.options] + (["--max", str(args.max)] if args.max else [])
+        )
     if args.command == "agents":
         return show_agents(args.last, as_json=args.json)
     if args.command == "watch":
