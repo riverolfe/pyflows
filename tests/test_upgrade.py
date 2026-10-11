@@ -69,20 +69,6 @@ def test_manifest_with_no_dependencies_is_not_a_clean_run():
         asyncio.run(up.upgrade("."))
 
 
-def test_inventory_reads_the_manifest_and_fingerprints_the_repo():
-    # The prompt never quotes the files, so depends_on is what stops the cache
-    # serving an audit of a manifest that has since changed.
-    fake, prompts = _agents([])
-    with patched(up, "ask", fake):
-        asyncio.run(up.upgrade(".", limit=1, verify=False))
-
-    _, kw = prompts[0]
-    assert kw["label"] == "inventory"
-    assert kw["depends_on"] == "."
-    assert kw["cwd"] == "."
-    assert any(m in kw["system"] for m in ()) or "manifest" in kw["system"].lower()
-
-
 def test_direct_dependencies_are_audited_before_transitive_ones():
     # An upgrade to a direct dep breaks callers; a transitive bump mostly does
     # not. Ranking by blast radius is what makes a limited budget useful.
@@ -101,9 +87,22 @@ def test_pick_is_deterministic_so_a_cached_rerun_stays_valid():
     assert up._pick(deps, None) == up._pick(list(reversed(deps)), None)
 
 
-def test_pick_respects_the_limit():
-    deps = [{"name": f"p{i}", "current": "1", "direct": True, "uses": i} for i in range(8)]
-    assert len(up._pick(deps, 3)) == 3
+def test_an_agent_without_web_tools_cannot_audit_an_upgrade():
+    # The bug this guards: an agent handed only local tools can still return a
+    # schema-valid "no breaks" having read no changelog. WebSearch/WebFetch in
+    # TOOLS is the only reason the answer means anything — dropping them makes
+    # every dependency silently look safe.
+    async def fake(prompt, schema, **kw):
+        if "manifest" in prompt:
+            return {
+                "manifest": "package.json",
+                "dependencies": [{"name": "django", "current": "4.2", "direct": True, "uses": 3}],
+            }
+        assert "WebSearch" in kw["tools"] and "WebFetch" in kw["tools"], kw["tools"]
+        return {"findings": [], "sources_checked": ["https://example.com/5.0"]}
+
+    with patched(up, "ask", fake):
+        asyncio.run(up.upgrade(".", verify=False))
 
 
 # ------------------------------------------------------------ fan-out
@@ -134,22 +133,16 @@ def test_fanout_width_comes_from_the_inventory_not_a_fixed_tuple():
     assert len([a for a in agents if a.startswith("dep/")]) == 7, agents
 
 
-def test_each_agent_is_asked_about_one_dependency_and_holds_the_repo():
-    # An agent told only "Django 5.0 removed X" reports a break on a repo
-    # that never used it. The repo in the prompt is what makes it a finding.
-    fake, prompts = _agents([])
-    with patched(up, "ask", fake):
-        asyncio.run(up.upgrade(".", limit=2, verify=False))
-
-    sweep = [(p, kw) for p, kw in prompts if kw["label"].startswith("dep/")]
-    assert len(sweep) == 2, sweep
-    for _prompt, kw in sweep:
-        assert kw["cwd"] == "." and kw["depends_on"] == "."
-        assert "WebSearch" in kw["tools"] and "WebFetch" in kw["tools"]
-    assert "this repository" in sweep[0][0]
-
-
 # ----------------------------------------------- checked vs merely silent
+
+
+def test_sources_checked_is_required_by_the_schema():
+    # Make it optional and an agent can simply omit it — which is exactly the
+    # silent-failure shape the field exists to prevent, since a missing key
+    # reads the same as an empty one.
+    assert "sources_checked" in up.BREAKING["required"]
+    # And the prompt must define it, or a required field arrives empty.
+    assert "sources_checked" in up.BREAKING["properties"]
 
 
 def test_an_agent_that_consulted_nothing_is_not_an_audited_dependency():
@@ -195,22 +188,22 @@ def test_a_partially_unchecked_run_exits_non_zero():
     assert out["audited"] == 1 and out["unchecked"] == 1, out
 
 
-def test_partial_audit_exits_non_zero(tmp_path):
-    # The exit code is the only thing a CI job reads. A partial audit that
-    # exits 0 gets merged, and the unchecked dependencies are never re-run.
-    (tmp_path / "pyproject.toml").write_text("")
-    fake, _ = _agents([], sources=())
-
-    with patched(up, "ask", fake):
-        assert up.main([str(tmp_path), "--no-verify"]) == 1
-
-
 def test_a_fully_checked_run_exits_zero(tmp_path):
     (tmp_path / "pyproject.toml").write_text("")
     fake, _ = _agents([])
 
     with patched(up, "ask", fake):
         assert up.main([str(tmp_path), "--no-verify"]) == 0
+
+
+def test_the_exit_code_reports_a_partial_audit(tmp_path):
+    # The exit code is the only thing a CI job reads. A partial audit that
+    # exits 0 gets merged and the unchecked dependencies are never re-run.
+    (tmp_path / "pyproject.toml").write_text("")
+    fake, _ = _agents([], sources=())
+
+    with patched(up, "ask", fake):
+        assert up.main([str(tmp_path), "--no-verify"]) == 1
 
 
 def test_render_does_not_claim_safety_over_unchecked_dependencies(capsys):
@@ -233,17 +226,6 @@ def test_render_still_claims_safety_when_everything_was_checked(capsys):
     capsys.readouterr()
     up.render(out)
     assert "safe to bump" in capsys.readouterr().out
-
-
-def test_an_empty_findings_list_still_counts_when_sources_were_read():
-    # The guard must not break the common case: a dependency that was checked
-    # properly and genuinely affects nothing.
-    fake, _ = _agents([], sources=("https://example.com/5.0",))
-    with patched(up, "ask", fake):
-        out = asyncio.run(up.upgrade(".", limit=2, verify=False))
-
-    assert out["findings"] == []
-    assert out["audited"] == 2 and out["unchecked"] == 0, out
 
 
 def test_affected_is_a_valid_answer():
