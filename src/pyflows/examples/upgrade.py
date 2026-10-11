@@ -93,13 +93,27 @@ BREAKING = {
     "required": ["findings", "sources_checked"],
 }
 
-VERDICT = {
+# One agent judges a BATCH of breaks, same shape review.py's BATCH uses: the
+# source read dominates cost, so judging 5 in one call beats 5 re-reads. An
+# array keyed by index, not a flat object — a single object cannot name which
+# of the 5 claims it is answering for.
+VERDICTS = {
     "type": "object",
     "properties": {
-        "breaks_here": {"type": "boolean"},
-        "reason": {"type": "string"},
+        "verdicts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "breaks_here": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["index", "breaks_here", "reason"],
+            },
+        }
     },
-    "required": ["breaks_here", "reason"],
+    "required": ["verdicts"],
 }
 
 
@@ -274,9 +288,9 @@ async def upgrade(
                     for i, f in enumerate(batch)
                 )
                 + "\n\nDefault to breaks_here=false. The cited changelog "
-                f"existing is not evidence that this repo hits it. Return "
-                f"{len(batch)} verdicts.",
-                VERDICT,
+                "existing is not evidence that this repo hits it. Return one "
+                "verdict per claim, keyed by its [n] index.",
+                VERDICTS,
                 tools=TOOLS,
                 spend=spend,
                 cwd=target,
@@ -294,9 +308,17 @@ async def upgrade(
                 {"finding": f, "why": "verifier did not answer"} for f in batch
             )
             continue
-        for f, v in zip(batch, verdict.get("verdicts", []), strict=False):
-            entry = {"finding": f, "why": v.get("reason", "")}
-            (result["confirmed"] if v.get("breaks_here") else result["refuted"]).append(entry)
+        # Keyed by index, not position: an agent that returns its verdicts out
+        # of order must not attribute a reason to the wrong claim. A claim with
+        # no verdict was never refuted — it falls into unconfirmed, not refuted.
+        by_index = {v.get("index"): v for v in verdict.get("verdicts", [])}
+        for i, f in enumerate(batch):
+            v = by_index.get(i)
+            if v is None:
+                result["refuted"].append({"finding": f, "why": "verifier skipped this claim"})
+            else:
+                entry = {"finding": f, "why": v.get("reason", "")}
+                (result["confirmed"] if v.get("breaks_here") else result["refuted"]).append(entry)
 
     result["elapsed"] = time.monotonic() - started
     return result

@@ -2,6 +2,7 @@
 
 import asyncio
 
+import jsonschema
 import pytest
 
 import pyflows.examples.upgrade as up
@@ -29,6 +30,14 @@ def _agents(findings_per_dep, verdicts=None, sources=("https://example.com/chang
 
     async def fake(prompt, schema, **kw):
         prompts.append((prompt, kw))
+        out = _respond(prompt)
+        # The real agent's output is validated against `schema` in ask(). So is
+        # the fake's: a fake free to drift from the schema is how a module ends
+        # up reading a key the schema does not define.
+        jsonschema.validate(out, schema)
+        return out
+
+    def _respond(prompt):
         if "manifest" in prompt or "dependency manifest" in prompt:
             return {
                 "manifest": "pyproject.toml",
@@ -42,7 +51,11 @@ def _agents(findings_per_dep, verdicts=None, sources=("https://example.com/chang
             if verdicts is not None:
                 return verdicts
             n = len([ln for ln in prompt.splitlines() if ln.startswith("[")])
-            return {"verdicts": [{"breaks_here": True, "reason": "confirmed"} for _ in range(n)]}
+            return {
+                "verdicts": [
+                    {"index": i, "breaks_here": True, "reason": "confirmed"} for i in range(n)
+                ]
+            }
         return {"findings": findings_per_dep, "sources_checked": list(sources)}
 
     return fake, prompts
@@ -291,7 +304,7 @@ def test_suspected_breaks_are_refuted_before_they_are_reported():
 def test_a_refuted_break_is_reported_as_refuted_not_dropped():
     # Silently dropping it makes a clean run and a wrong call look identical.
     fake, _ = _agents(
-        [BREAK], verdicts={"verdicts": [{"breaks_here": False, "reason": "unaffected"}]}
+        [BREAK], verdicts={"verdicts": [{"index": 0, "breaks_here": False, "reason": "unaffected"}]}
     )
     with patched(up, "ask", fake):
         out = asyncio.run(up.upgrade(".", limit=1))
