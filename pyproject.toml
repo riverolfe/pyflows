@@ -5,7 +5,7 @@ description = "Agent orchestration in Python: a subprocess gate, a disk cache, a
 readme = "README.md"
 license = "MIT"
 authors = [
-    { name = "Kaito", email = "kaito@anthropic.com" }
+    { name = "riverolfe", email = "139211102+riverolfe@users.noreply.github.com" }
 ]
 keywords = ["agents", "llm", "orchestration", "claude", "cli"]
 requires-python = ">=3.12"

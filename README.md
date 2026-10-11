@@ -17,7 +17,7 @@ async def review(target):
 Not published to PyPI yet. From a clone:
 
 ```bash
-git clone https://github.com/kaito/pyflows
+git clone https://github.com/riverolfe/pyflows
 cd pyflows
 uv sync
 uv run pyflows --help
@@ -26,7 +26,7 @@ uv run pyflows --help
 Or install into your own project:
 
 ```bash
-uv add "pyflows @ git+https://github.com/kaito/pyflows"
+uv add "pyflows @ git+https://github.com/riverolfe/pyflows"
 ```
 
 Requires Python 3.12+.
