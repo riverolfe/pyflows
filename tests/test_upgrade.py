@@ -1,0 +1,402 @@
+"""upgrade: the example workflow."""
+
+import asyncio
+
+import pytest
+
+import pyflows.examples.upgrade as up
+import pyflows.orch as orch
+from conftest import patched
+
+DEP = {"name": "django", "current": "4.2", "direct": True, "uses": 12}
+BREAK = {
+    "file": "app/views.py",
+    "line": 40,
+    "dependency": "django",
+    "summary": "django.utils.timezone.utc removed in 5.0",
+    "failure": "ImportError at boot",
+    "url": "https://docs.djangoproject.com/en/5.0/releases/5.0/",
+}
+
+
+def _agents(findings_per_dep, verdicts=None, sources=("https://example.com/changelog",)):
+    """A fake ask() that records every prompt it is handed.
+
+    `sources` defaults to one changelog, i.e. an agent that actually checked
+    something. Pass `sources=()` to model an agent whose web tools failed.
+    """
+    prompts = []
+
+    async def fake(prompt, schema, **kw):
+        prompts.append((prompt, kw))
+        if "manifest" in prompt or "dependency manifest" in prompt:
+            return {
+                "manifest": "pyproject.toml",
+                "dependencies": [
+                    {"name": "django", "current": "4.2", "direct": True, "uses": 12},
+                    {"name": "requests", "current": "2.28", "direct": True, "uses": 3},
+                    {"name": "attrs", "current": "21.0", "direct": False, "uses": 0},
+                ],
+            }
+        if "REFUTE" in prompt:
+            if verdicts is not None:
+                return verdicts
+            n = len([ln for ln in prompt.splitlines() if ln.startswith("[")])
+            return {"verdicts": [{"breaks_here": True, "reason": "confirmed"} for _ in range(n)]}
+        return {"findings": findings_per_dep, "sources_checked": list(sources)}
+
+    return fake, prompts
+
+
+# ------------------------------------------------------------- inventory
+
+
+def test_inventory_failure_is_not_an_empty_manifest():
+    # "No manifest found" and "the inventory agent died" are different
+    # outcomes, and the first must never be reported as the second.
+    async def dead(*a, **kw):
+        return None
+
+    with patched(up, "ask", dead), pytest.raises(up.UpgradeFailed):
+        asyncio.run(up.upgrade("."))
+
+
+def test_manifest_with_no_dependencies_is_not_a_clean_run():
+    async def empty(*a, **kw):
+        return {"manifest": "pyproject.toml", "dependencies": []}
+
+    with patched(up, "ask", empty), pytest.raises(up.UpgradeFailed):
+        asyncio.run(up.upgrade("."))
+
+
+def test_inventory_reads_the_manifest_and_fingerprints_the_repo():
+    # The prompt never quotes the files, so depends_on is what stops the cache
+    # serving an audit of a manifest that has since changed.
+    fake, prompts = _agents([])
+    with patched(up, "ask", fake):
+        asyncio.run(up.upgrade(".", limit=1, verify=False))
+
+    _, kw = prompts[0]
+    assert kw["label"] == "inventory"
+    assert kw["depends_on"] == "."
+    assert kw["cwd"] == "."
+    assert any(m in kw["system"] for m in ()) or "manifest" in kw["system"].lower()
+
+
+def test_direct_dependencies_are_audited_before_transitive_ones():
+    # An upgrade to a direct dep breaks callers; a transitive bump mostly does
+    # not. Ranking by blast radius is what makes a limited budget useful.
+    deps = [
+        {"name": "attrs", "current": "1", "direct": False, "uses": 0},
+        {"name": "requests", "current": "1", "direct": True, "uses": 2},
+        {"name": "django", "current": "1", "direct": True, "uses": 50},
+    ]
+    assert [d["name"] for d in up._pick(deps, None)] == ["django", "requests", "attrs"]
+
+
+def test_pick_is_deterministic_so_a_cached_rerun_stays_valid():
+    # The cache keys on the prompt, so the same repo must select the same
+    # dependencies or a second run audits something the first one skipped.
+    deps = [{"name": f"p{i}", "current": "1", "direct": True, "uses": i} for i in range(8)]
+    assert up._pick(deps, None) == up._pick(list(reversed(deps)), None)
+
+
+def test_pick_respects_the_limit():
+    deps = [{"name": f"p{i}", "current": "1", "direct": True, "uses": i} for i in range(8)]
+    assert len(up._pick(deps, 3)) == 3
+
+
+# ------------------------------------------------------------ fan-out
+
+
+def test_fanout_width_comes_from_the_inventory_not_a_fixed_tuple():
+    # This is what makes upgrade different from review and research: the
+    # number of agents is decided by what stage one found.
+    async def fake(prompt, schema, **kw):
+        if "manifest" in prompt:
+            return {
+                "manifest": "package.json",
+                "dependencies": [
+                    {"name": f"p{i}", "current": "1", "direct": True, "uses": i} for i in range(7)
+                ],
+            }
+        return {"findings": []}
+
+    agents = []
+
+    async def counting(prompt, schema, **kw):
+        agents.append(kw.get("label"))
+        return await fake(prompt, schema, **kw)
+
+    with patched(up, "ask", counting):
+        asyncio.run(up.upgrade(".", verify=False))
+
+    assert len([a for a in agents if a.startswith("dep/")]) == 7, agents
+
+
+def test_each_agent_is_asked_about_one_dependency_and_holds_the_repo():
+    # An agent told only "Django 5.0 removed X" reports a break on a repo
+    # that never used it. The repo in the prompt is what makes it a finding.
+    fake, prompts = _agents([])
+    with patched(up, "ask", fake):
+        asyncio.run(up.upgrade(".", limit=2, verify=False))
+
+    sweep = [(p, kw) for p, kw in prompts if kw["label"].startswith("dep/")]
+    assert len(sweep) == 2, sweep
+    for _prompt, kw in sweep:
+        assert kw["cwd"] == "." and kw["depends_on"] == "."
+        assert "WebSearch" in kw["tools"] and "WebFetch" in kw["tools"]
+    assert "this repository" in sweep[0][0]
+
+
+# ----------------------------------------------- checked vs merely silent
+
+
+def test_an_agent_that_consulted_nothing_is_not_an_audited_dependency():
+    # The failure this guards: WebFetch dies, the agent still returns a clean
+    # schema-valid "no breaks", and the run reports the deps as safe to bump.
+    # It cost 0.41M tokens and 917s to learn nothing that way.
+    fake, _ = _agents([], sources=())
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", limit=2, verify=False))
+
+    assert out["audited"] == 0, out
+    assert out["unchecked"] == 2, out
+
+
+def test_a_fully_unchecked_run_is_not_a_clean_run():
+    # Nothing was checked, so nothing may be concluded. Exits non-zero rather
+    # than printing "the deps look safe to bump".
+    fake, _ = _agents([], sources=())
+    with patched(up, "ask", fake), pytest.raises(up.UpgradeFailed):
+        asyncio.run(up.upgrade(".", limit=2, verify=True))
+
+
+def test_a_partially_unchecked_run_exits_non_zero():
+    async def fake(prompt, schema, **kw):
+        if "manifest" in prompt:
+            return {
+                "manifest": "package.json",
+                "dependencies": [
+                    {"name": "django", "current": "4.2", "direct": True, "uses": 9},
+                    {"name": "requests", "current": "2.28", "direct": True, "uses": 9},
+                ],
+            }
+        # django checked a changelog; requests could not reach one.
+        checked = "requests" in prompt
+        return {
+            "findings": [],
+            "sources_checked": ["https://example.com/5.0"] if checked else [],
+        }
+
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", verify=False))
+
+    assert out["audited"] == 1 and out["unchecked"] == 1, out
+
+
+def test_partial_audit_exits_non_zero(tmp_path):
+    # The exit code is the only thing a CI job reads. A partial audit that
+    # exits 0 gets merged, and the unchecked dependencies are never re-run.
+    (tmp_path / "pyproject.toml").write_text("")
+    fake, _ = _agents([], sources=())
+
+    with patched(up, "ask", fake):
+        assert up.main([str(tmp_path), "--no-verify"]) == 1
+
+
+def test_a_fully_checked_run_exits_zero(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("")
+    fake, _ = _agents([])
+
+    with patched(up, "ask", fake):
+        assert up.main([str(tmp_path), "--no-verify"]) == 0
+
+
+def test_render_does_not_claim_safety_over_unchecked_dependencies(capsys):
+    # "no confirmed breaks" is only a statement about what was checked.
+    fake, _ = _agents([], sources=())
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", limit=1, verify=False))
+    capsys.readouterr()
+    up.render(out)
+    text = capsys.readouterr().out
+
+    assert "safe to bump" not in text, text
+    assert "NOT checked" in text, text
+
+
+def test_render_still_claims_safety_when_everything_was_checked(capsys):
+    fake, _ = _agents([])
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", limit=1, verify=False))
+    capsys.readouterr()
+    up.render(out)
+    assert "safe to bump" in capsys.readouterr().out
+
+
+def test_an_empty_findings_list_still_counts_when_sources_were_read():
+    # The guard must not break the common case: a dependency that was checked
+    # properly and genuinely affects nothing.
+    fake, _ = _agents([], sources=("https://example.com/5.0",))
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", limit=2, verify=False))
+
+    assert out["findings"] == []
+    assert out["audited"] == 2 and out["unchecked"] == 0, out
+
+
+def test_affected_is_a_valid_answer():
+    # The common case is "nothing breaks here". An empty result must not be
+    # treated as a dead agent, or every clean repo looks broken.
+    fake, _ = _agents([])
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", limit=2, verify=False))
+    assert out["findings"] == []
+    assert out["audited"] == 2, out["audited"]
+
+
+def test_all_agents_dead_is_not_a_clean_run():
+    async def dead_after_inventory(prompt, schema, **kw):
+        if "manifest" in prompt:
+            return {"manifest": "pyproject.toml", "dependencies": [DEP]}
+        return None
+
+    with patched(up, "ask", dead_after_inventory), pytest.raises(up.UpgradeFailed):
+        asyncio.run(up.upgrade(".", verify=False))
+
+
+def test_budget_caps_the_fanout_and_says_so(capsys):
+    # The run cannot cover 40 dependencies inside MAX_CALLS. Silently auditing
+    # the first 12 reads as "these 12 are the only ones that matter".
+    many = [{"name": f"p{i}", "current": "1", "direct": True, "uses": i} for i in range(40)]
+
+    async def fake(prompt, schema, **kw):
+        if "manifest" in prompt:
+            return {"manifest": "package.json", "dependencies": many}
+        return {"findings": []}
+
+    with patched(up, "ask", fake):
+        asyncio.run(up.upgrade(".", verify=False))
+
+    out = capsys.readouterr().out
+    assert "fit the budget" in out, out
+    assert len(many) > orch.MAX_CALLS // 2
+
+
+def test_explicit_limit_is_not_reported_as_a_budget_shortfall(capsys):
+    # The user asked for 2. That is not a ceiling we failed to reach.
+    fake, _ = _agents([])
+    with patched(up, "ask", fake):
+        asyncio.run(up.upgrade(".", limit=2, verify=False))
+    assert "fit the budget" not in capsys.readouterr().out
+
+
+# ------------------------------------------------------------- verifying
+
+
+def test_suspected_breaks_are_refuted_before_they_are_reported():
+    fake, prompts = _agents([BREAK])
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", limit=1))
+
+    assert len(out["confirmed"]) == 1, out
+    verify = [p for p, _ in prompts if "REFUTE" in p]
+    assert verify, "a candidate break was reported without a refutation attempt"
+    assert "not evidence that this repo hits it" in verify[0]
+
+
+def test_a_refuted_break_is_reported_as_refuted_not_dropped():
+    # Silently dropping it makes a clean run and a wrong call look identical.
+    fake, _ = _agents(
+        [BREAK], verdicts={"verdicts": [{"breaks_here": False, "reason": "unaffected"}]}
+    )
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", limit=1))
+
+    assert out["confirmed"] == []
+    assert len(out["refuted"]) == 1
+    assert out["refuted"][0]["why"] == "unaffected"
+
+
+def test_a_finding_with_no_changelog_url_cannot_be_verified(capsys):
+    # The verifier can only fetch a URL; without one it would confirm a
+    # breaking change it never saw evidence for.
+    fake, prompts = _agents([{**BREAK, "url": ""}])
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", limit=1))
+
+    assert out["findings"] == []
+    assert not [p for p, _ in prompts if "REFUTE" in p]
+    assert "cannot be verified" in capsys.readouterr().out
+
+
+def test_the_same_break_from_two_agents_is_one_finding():
+    # django and requests both flag the same line; it is one line item.
+    async def fake(prompt, schema, **kw):
+        if "manifest" in prompt:
+            return {
+                "manifest": "package.json",
+                "dependencies": [
+                    {"name": "django", "current": "4.2", "direct": True, "uses": 5},
+                    {"name": "requests", "current": "2.28", "direct": True, "uses": 5},
+                ],
+            }
+        return {"findings": [BREAK]}
+
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", verify=False))
+    assert len(out["findings"]) == 1, out["findings"]
+
+
+def test_two_dependencies_breaking_the_same_line_stay_separate():
+    # Deduplicating on (file, line) alone merges two distinct problems into
+    # one and reports only whichever agent happened to answer first — the
+    # second dependency's upgrade then looks clean.
+    async def fake(prompt, schema, **kw):
+        if "manifest" in prompt:
+            return {
+                "manifest": "package.json",
+                "dependencies": [
+                    {"name": "django", "current": "4.2", "direct": True, "uses": 5},
+                    {"name": "requests", "current": "2.28", "direct": True, "uses": 5},
+                ],
+            }
+        # Same file:line, different dependency — two real breaks.
+        return {"findings": [BREAK, {**BREAK, "dependency": "requests", "summary": "s"}]}
+
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", verify=False))
+
+    assert len(out["findings"]) == 2, out["findings"]
+    assert {f["dependency"] for f in out["findings"]} == {"django", "requests"}
+
+
+def test_no_verify_skips_the_refutation_stage():
+    fake, prompts = _agents([BREAK])
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", limit=1, verify=False))
+    assert not [p for p, _ in prompts if "REFUTE" in p]
+    assert out["findings"] == [BREAK]
+
+
+# ------------------------------------------------------------------ cli
+
+
+def test_manifest_lookup_prefers_the_first_known_file(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("")
+    (tmp_path / "package.json").write_text("")
+    assert up.find_manifest(tmp_path) == "package.json"
+
+    (tmp_path / "package.json").unlink()
+    assert up.find_manifest(tmp_path) == "pyproject.toml"
+
+
+def test_missing_manifest_exits_before_spending_anything(tmp_path, capsys):
+    # A wrong path or a repo with no manifest is a CLI error, not a run that
+    # discovers nothing and exits clean.
+    assert up.main([str(tmp_path / "nope")]) == 1
+    assert "no such path" in capsys.readouterr().out
+
+    assert up.main([str(tmp_path)]) == 1
+    assert "no manifest" in capsys.readouterr().out

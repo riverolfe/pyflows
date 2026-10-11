@@ -1,0 +1,51 @@
+[project]
+name = "pyflows"
+version = "0.1.0"
+description = "Agent orchestration in Python: a subprocess gate, a disk cache, and a token ceiling"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Kaito", email = "kaito@anthropic.com" }
+]
+keywords = ["agents", "llm", "orchestration", "claude", "cli"]
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.2.165",
+    "diskcache>=5.6.3",
+    "jsonschema>=4.26.0",
+]
+
+# review.py owns the dispatcher and delegates to research and upgrade. It is an
+# example, but it is the one the CLI lives in — the framework itself has none.
+[project.scripts]
+pyflows = "pyflows.examples.review:main"
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.17.0",
+    "ty>=0.0.86",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RET", "ARG"]
+ignore = [
+    "E501",    # line length is ruff format's job
+    "SIM105",  # contextlib.suppress hides the guard's intent
+    "RET504",  # a named result before return reads better than a bare return
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests reach into private names and hand-roll fakes; both are the point.
+"tests/*" = ["ARG", "SLF001"]
+
+[tool.ty.rules]
+unresolved-import = "error"
