@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+from typing import Any, cast
 
 import pytest
 
@@ -666,12 +667,16 @@ def test_agents_sharing_a_label_get_distinct_ones():
 
 
 def test_extensions_reject_bad_shapes_and_cannot_be_changed():
-    for kw in (
+    # Annotated dict[str, Any] because the point of the list is that the
+    # values are the wrong type for every field — the union ty infers from an
+    # unannotated tuple is exactly what the constructor is meant to reject.
+    bad_shapes: tuple[dict[str, Any], ...] = (
         {"skills": "qmd"},
         {"plugins": [1]},
         {"mcp": {"x": ["not", "a", "config"]}},
         {"mcp": {"x": {"obj": object()}}},
-    ):
+    )
+    for kw in bad_shapes:
         with pytest.raises(orch.ExtensionError):
             orch.Extensions(**kw)
 
@@ -679,10 +684,17 @@ def test_extensions_reject_bad_shapes_and_cannot_be_changed():
     ext = orch.Extensions(mcp=source)
     source["crg"]["command"] = "changed"
     assert ext.mcp_servers() == {"crg": {"command": "crg", "args": ["serve"]}}
+    # cast, not a suppression comment: the test deliberately lies to the type
+    # checker — `mcp` is a frozen Mapping, and the point is that pretending it
+    # is a dict does not make assignment work at runtime.
+    as_dict = cast(dict[str, Any], orch.NO_EXTENSIONS.mcp)
     with pytest.raises(TypeError):
-        orch.NO_EXTENSIONS.mcp["x"] = {}  # type: ignore[index]
+        as_dict["x"] = {}
     with pytest.raises(TypeError):
-        ext.mcp["crg"]["command"] = "x"  # type: ignore[index]
+        # No suppression needed: mcp's values are Any, so the inner assignment
+        # type-checks. The old `# type: ignore[index]` was for mypy, which this
+        # repo does not run.
+        ext.mcp["crg"]["command"] = "x"
     assert hash(ext) == hash(orch.Extensions(mcp={"crg": {"command": "crg", "args": ["serve"]}}))
     assert orch.NO_EXTENSIONS.key() == ""
 
