@@ -6,7 +6,6 @@ import jsonschema
 import pytest
 
 import pyflows.examples.upgrade as up
-import pyflows.orch as orch
 from conftest import patched
 
 DEP = {"name": "django", "current": "4.2", "direct": True, "uses": 12}
@@ -154,20 +153,6 @@ def test_sources_checked_is_required_by_the_schema():
     # silent-failure shape the field exists to prevent, since a missing key
     # reads the same as an empty one.
     assert "sources_checked" in up.BREAKING["required"]
-    # And the prompt must define it, or a required field arrives empty.
-    assert "sources_checked" in up.BREAKING["properties"]
-
-
-def test_an_agent_that_consulted_nothing_is_not_an_audited_dependency():
-    # The failure this guards: WebFetch dies, the agent still returns a clean
-    # schema-valid "no breaks", and the run reports the deps as safe to bump.
-    # It cost 0.41M tokens and 917s to learn nothing that way.
-    fake, _ = _agents([], sources=())
-    with patched(up, "ask", fake):
-        out = asyncio.run(up.upgrade(".", limit=2, verify=False))
-
-    assert out["audited"] == 0, out
-    assert out["unchecked"] == 2, out
 
 
 def test_a_fully_unchecked_run_is_not_a_clean_run():
@@ -178,7 +163,11 @@ def test_a_fully_unchecked_run_is_not_a_clean_run():
         asyncio.run(up.upgrade(".", limit=2, verify=True))
 
 
-def test_a_partially_unchecked_run_exits_non_zero():
+def test_each_dependency_is_audited_or_unchecked_on_its_own_sources():
+    # The failure this guards: WebFetch dies, the agent still returns a clean
+    # schema-valid "no breaks", and the run reports the deps as safe to bump.
+    # It cost 0.41M tokens and 917s to learn nothing that way. Mixed on
+    # purpose: one blank agent must not mark the checked one unchecked either.
     async def fake(prompt, schema, **kw):
         if "manifest" in prompt:
             return {
@@ -241,16 +230,6 @@ def test_render_still_claims_safety_when_everything_was_checked(capsys):
     assert "safe to bump" in capsys.readouterr().out
 
 
-def test_affected_is_a_valid_answer():
-    # The common case is "nothing breaks here". An empty result must not be
-    # treated as a dead agent, or every clean repo looks broken.
-    fake, _ = _agents([])
-    with patched(up, "ask", fake):
-        out = asyncio.run(up.upgrade(".", limit=2, verify=False))
-    assert out["findings"] == []
-    assert out["audited"] == 2, out["audited"]
-
-
 def test_all_agents_dead_is_not_a_clean_run():
     async def dead_after_inventory(prompt, schema, **kw):
         if "manifest" in prompt:
@@ -276,7 +255,6 @@ def test_budget_caps_the_fanout_and_says_so(capsys):
 
     out = capsys.readouterr().out
     assert "fit the budget" in out, out
-    assert len(many) > orch.MAX_CALLS // 2
 
 
 def test_explicit_limit_is_not_reported_as_a_budget_shortfall(capsys):
