@@ -10,7 +10,7 @@ import json
 import sys
 import time
 
-from .orch import RUN_LOG, read_runs
+from .orch import RUN_LOG, clean_text, read_runs
 
 # The 32-char stage column below is the contract every workflow labels against.
 STAGE_COL = 32
@@ -82,7 +82,9 @@ def _render(run: list[dict]) -> str:
     # Upgrade logs no count: its fan-out width is not known until the
     # inventory lands. "None lenss" was what that rendered as.
     fanout = f", {count} {one if count == 1 else many}" if count is not None else ""
-    target = start.get("target", "?")
+    # The log is replayed raw; a label or target carrying ESC would drive the
+    # terminal. One line each — a newline would break the table.
+    target = clean_text(str(start.get("target", "?")), newlines=False)
     # Questions are long and arbitrary; paths are short. Truncate the question.
     if mode == "research" and len(target) > 58:
         target = target[:57] + "…"
@@ -92,6 +94,7 @@ def _render(run: list[dict]) -> str:
         f"{'stage':<{STAGE_COL}} {'status':<8} {'in':>8} {'out':>7} {'sec':>6}",
     ]
     for label, status, tok_in, tok_out, secs in rows:
+        label = clean_text(label, newlines=False)
         # Truncate from the left: the tail of a path is the useful half.
         stage = label if len(label) <= STAGE_COL else "…" + label[-(STAGE_COL - 1) :]
         lines.append(f"{stage:<{STAGE_COL}} {status:<8} {tok_in:>8} {tok_out:>7} {secs:>6}")

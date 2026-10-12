@@ -281,6 +281,10 @@ These are the rules the tests exist to protect. Each one is a bug that shipped.
   and left the real outcome as an orphan row — an agent that never produced
   valid output displayed as finished. A retried agent's record sums both calls
   and says `retry: true`; a `FAIL` or `BUDGET` row still shows what it cost.
+- **Model output never drives the terminal.** It is derived from untrusted
+  repos and web pages and printed raw, so `ask()` strips control characters
+  (ESC, CR, backspace, bidi overrides) from every string it returns — cached
+  results included — and the panel strips them from labels and targets.
 - **Batched verdicts are paired by occurrence, not by label.** Labels repeat;
   keying on them merged two agents into one row and hung the second at
   `running` forever.

@@ -158,3 +158,17 @@ def test_research_labels_fit_the_panel_column():
     assert labels, "no stage labels captured"
     for label in labels:
         assert len(label) <= panel.STAGE_COL, f"{label!r} would be truncated by the panel"
+
+
+def test_render_strips_terminal_control_characters():
+    # Labels come from model output (upgrade's dep/<name>) and the log is
+    # replayed raw: an ESC sequence would clear the screen or recolour the
+    # panel, a newline would break the table.
+    out = panel._render(
+        [
+            {"outcome": "run_start", "target": "src\x1b[2J", "mode": "full", "lenses": 1},
+            {"label": "dep/\x1b[31mevil\nrow", "outcome": "started"},
+        ]
+    )
+    assert "\x1b" not in out, repr(out)
+    assert "dep/[31mevil row" in out, repr(out)

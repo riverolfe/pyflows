@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,30 @@ CACHE = diskcache.Cache(str(_env_path("PYFLOWS_CACHE", CACHE_DEFAULT)))
 # One JSON line per ask(), so a finished run can be interrogated per agent:
 #   jq -r 'select(.label|startswith("verify/")) | "\(.label) \(.input)"' run.jsonl
 RUN_LOG = _env_path("PYFLOWS_RUN_LOG", RUN_LOG_DEFAULT)
+
+
+# Terminal control characters: C0/C1 (ESC, CR, backspace…) and the bidi
+# overrides that reorder what a line appears to say. Model output reaches the
+# terminal raw, and it is derived from untrusted repos and web pages — an ESC
+# sequence in a "summary" can clear the screen or rewrite earlier lines.
+_CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+
+
+def clean_text(text: str, *, newlines: bool = True) -> str:
+    """Strip control characters; keep \\n and \\t unless `newlines` is False."""
+    text = _CONTROL.sub("", text)
+    return text if newlines else text.replace("\n", " ").replace("\t", " ")
+
+
+def _clean(value: Any) -> Any:
+    """clean_text() every string in a JSON-shaped value."""
+    if isinstance(value, str):
+        return clean_text(value)
+    if isinstance(value, list):
+        return [_clean(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _clean(v) for k, v in value.items()}
+    return value
 
 
 def _log_run(record: dict) -> None:
@@ -401,7 +426,7 @@ async def ask(
     if use_cache and (hit := CACHE.get(key)) is not None:
         STATS.cache_hits += 1
         STATS.note(label, "cache_hit")
-        return hit
+        return _clean(hit)  # entries cached before cleaning existed
 
     if spend is not None:
         spend.take()
@@ -485,6 +510,8 @@ async def ask(
             return None
 
     STATS.finish(label, "ok", usage, retry=retried)
+    # Cleaned once here, so no workflow has to remember to before printing.
+    out = _clean(out)
     if use_cache:
         CACHE.set(key, out)
     return out
