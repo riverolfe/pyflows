@@ -25,16 +25,24 @@ GATE = asyncio.Semaphore(8)
 # failed stage costs one slot, not the round.
 MAX_CALLS = 40
 
-# expanduser(), not a bare "~": Path("~/.cache/x") is a RELATIVE path, so the
-# default landed in ./~/.cache/ — inside the repo, where `rm -rf` and gitignore
-# never find it.
-CACHE = diskcache.Cache(str(Path(os.environ.get("PYFLOWS_CACHE", "~/.cache/pyflows")).expanduser()))
+CACHE_DEFAULT = "~/.cache/pyflows"
+# Deliberately NOT inside the cache dir — `rm -rf ~/.cache/pyflows` is how you
+# force a cold run, and it must not delete the record of what that run cost.
+RUN_LOG_DEFAULT = "~/.cache/pyflows-runs/run.jsonl"
+
+
+def _env_path(var: str, default: str) -> Path:
+    # expanduser(), not a bare "~": Path("~/.cache/x") is a RELATIVE path, so the
+    # default landed in ./~/.cache/ — inside the repo, where `rm -rf` and
+    # gitignore never find it.
+    return Path(os.environ.get(var, default)).expanduser()
+
+
+CACHE = diskcache.Cache(str(_env_path("PYFLOWS_CACHE", CACHE_DEFAULT)))
 
 # One JSON line per ask(), so a finished run can be interrogated per agent:
 #   jq -r 'select(.label|startswith("verify/")) | "\(.label) \(.input)"' run.jsonl
-# Deliberately NOT inside the cache dir — `rm -rf ~/.cache/pyflows` is how you
-# force a cold run, and it must not delete the record of what that run cost.
-RUN_LOG = Path(os.environ.get("PYFLOWS_RUN_LOG", "~/.cache/pyflows-runs/run.jsonl")).expanduser()
+RUN_LOG = _env_path("PYFLOWS_RUN_LOG", RUN_LOG_DEFAULT)
 
 
 def _log_run(record: dict) -> None:

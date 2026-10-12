@@ -326,17 +326,23 @@ def test_stats_reads_flat_usage_and_tolerates_null_duration():
     assert orch.STATS.seconds == 0.0
 
 
-def test_default_cache_paths_are_not_relative_to_the_cwd(tmp_path, monkeypatch):
+def test_default_paths_are_absolute_and_keep_the_log_out_of_the_cache(tmp_path, monkeypatch):
     # Path("~/.cache/x") is RELATIVE — the "~" is just a directory name. Both
     # defaults landed in ./~/.cache/ inside the repo being scanned, where
-    # `rm -rf ~/.cache/pyflows` and .gitignore never reach them.
+    # `rm -rf ~/.cache/pyflows` and .gitignore never reach them. And the log
+    # lives outside the cache dir: wiping the cache must not erase what runs cost.
     monkeypatch.delenv("PYFLOWS_CACHE", raising=False)
     monkeypatch.delenv("PYFLOWS_RUN_LOG", raising=False)
     monkeypatch.chdir(tmp_path)
 
-    cache = Path(os.environ.get("PYFLOWS_CACHE", "~/.cache/pyflows")).expanduser()
-    assert cache.is_absolute(), cache
-    assert not cache.is_relative_to(tmp_path), cache
+    cache = orch._env_path("PYFLOWS_CACHE", orch.CACHE_DEFAULT)
+    log = orch._env_path("PYFLOWS_RUN_LOG", orch.RUN_LOG_DEFAULT)
+    for path in (cache, log):
+        assert path.is_absolute() and not path.is_relative_to(tmp_path), path
+    assert not log.is_relative_to(cache), (log, cache)
+
+    monkeypatch.setenv("PYFLOWS_CACHE", "~/elsewhere")
+    assert orch._env_path("PYFLOWS_CACHE", orch.CACHE_DEFAULT).is_absolute()
 
 
 def test_run_log_survives_cache_wipe_and_appends_json(tmp_path):
