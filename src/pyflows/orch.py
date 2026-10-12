@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -166,6 +167,11 @@ DEFAULT_EXTS = (
     ".yml", ".yaml",
 )  # fmt: skip
 
+# Files modified this recently get their content hashed, not just stat'd: a
+# filesystem whose clock ticks coarser than this can stamp two writes alike.
+# 2s covers ext4's few-ms tick and FAT's 2s resolution.
+RACY_WINDOW_NS = 2_000_000_000
+
 # Never fingerprinted: dependencies and build output, not the code under review.
 SKIP_DIRS = frozenset(
     {
@@ -204,9 +210,15 @@ def stat_signature(root: str | Path, exts: tuple[str, ...] | None = None) -> str
     than hashing every file, and good enough to invalidate on edit. Nanosecond
     mtime, not seconds — two edits in the same second must not collide.
 
+    Nanosecond mtime is not nanosecond *precision*: ext4 stamps from a clock
+    that ticks every few ms, so two same-size writes in one tick look
+    identical. A file modified within RACY_WINDOW_NS has its content hashed
+    too — git's "racy git" rule. Old files stay a stat; only fresh ones are read.
+
     Pass `exts` to fingerprint something narrower than DEFAULT_EXTS.
     """
     exts = DEFAULT_EXTS if exts is None else exts
+    now = time.time_ns()
     parts = []
     for dirpath, dirnames, filenames in os.walk(root):
         # Prune in place: rglob would still descend into node_modules and only
@@ -219,9 +231,12 @@ def stat_signature(root: str | Path, exts: tuple[str, ...] | None = None) -> str
             path = Path(dirpath, name)
             try:
                 st = path.stat()
+                part = f"{path}:{st.st_size}:{st.st_mtime_ns}"
+                if now - st.st_mtime_ns < RACY_WINDOW_NS:
+                    part += ":" + hashlib.sha256(path.read_bytes()).hexdigest()
             except OSError:
                 continue
-            parts.append(f"{path}:{st.st_size}:{st.st_mtime_ns}")
+            parts.append(part)
     parts.sort()  # walk order is filesystem order; the key must not depend on it
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
