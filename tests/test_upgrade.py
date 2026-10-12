@@ -292,6 +292,61 @@ def test_a_refuted_break_is_reported_as_refuted_not_dropped():
     assert out["refuted"][0]["why"] == "unaffected"
 
 
+def test_a_dead_verifier_leaves_its_claims_unconfirmed_not_refuted(tmp_path, capsys):
+    # The bug: a verifier that died put its claims in "refuted", rendered as
+    # "upstream changes that do not hit this repo" — then "safe to bump", exit 0.
+    (tmp_path / "pyproject.toml").write_text("")
+    fake, _ = _agents([BREAK])
+
+    async def dead_verifier(prompt, schema, **kw):
+        return None if "REFUTE" in prompt else await fake(prompt, schema, **kw)
+
+    with patched(up, "ask", dead_verifier):
+        out = asyncio.run(up.upgrade(".", limit=1))
+        code = up.main([str(tmp_path), "--limit", "1"])
+
+    assert out["refuted"] == [] and len(out["unconfirmed"]) == 1, out
+    assert code == 1
+    assert "safe to bump" not in capsys.readouterr().out
+
+
+def test_a_skipped_claim_is_unconfirmed_not_refuted():
+    fake, _ = _agents([BREAK, {**BREAK, "line": 41}], verdicts={"verdicts": [
+        {"index": 0, "breaks_here": False, "reason": "unaffected"}
+    ]})  # fmt: skip
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", limit=1))
+
+    assert [e["why"] for e in out["refuted"]] == ["unaffected"]
+    assert [e["finding"]["line"] for e in out["unconfirmed"]] == [41]
+
+
+def test_findings_beyond_depth_are_unconfirmed_not_safe(tmp_path, capsys):
+    # The bug: --depth 3 of 10 findings verified 3, refuted all 3, and the
+    # other 7 vanished from the verdict — "safe to bump" over 7 unread claims.
+    (tmp_path / "pyproject.toml").write_text("")
+    fake, _ = _agents(
+        [{**BREAK, "line": n} for n in range(4)],
+        verdicts={"verdicts": [{"index": 0, "breaks_here": False, "reason": "no"}]},
+    )
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", limit=1, depth=1))
+        code = up.main([str(tmp_path), "--limit", "1", "--depth", "1"])
+    text = capsys.readouterr().out
+
+    assert len(out["refuted"]) == 1 and len(out["unconfirmed"]) == 3, out
+    assert code == 1
+    assert "safe to bump" not in text and "NOT verified" in text, text
+
+
+def test_no_verify_does_not_call_candidate_breaks_safe(tmp_path, capsys):
+    (tmp_path / "pyproject.toml").write_text("")
+    fake, _ = _agents([BREAK])
+    with patched(up, "ask", fake):
+        assert up.main([str(tmp_path), "--no-verify"]) == 1
+    assert "safe to bump" not in capsys.readouterr().out
+
+
 def test_a_finding_with_no_changelog_url_cannot_be_verified(capsys):
     # The verifier can only fetch a URL; without one it would confirm a
     # breaking change it never saw evidence for.
