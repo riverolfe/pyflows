@@ -137,10 +137,7 @@ def test_ask_loads_no_mcp_servers_not_even_the_users():
     opts = captured["options"]
     assert opts.strict_mcp_config is True
     assert opts.mcp_servers == {}, opts.mcp_servers
-    # Nor any settings: measured live, a Read/Grep/Glob agent in a repo whose
-    # .claude/settings.local.json allowed WebSearch ran a web search, and saw
-    # every user and plugin skill. The repo under review set its own reviewers'
-    # permissions. None of the defaults (user, project, local) may load.
+    # No settings, skills or plugins either.
     assert opts.setting_sources == [], opts.setting_sources
     assert opts.plugins == [] and opts.skills is None, (opts.plugins, opts.skills)
 
@@ -530,9 +527,6 @@ def _options_for(ext, **kw):
 
 
 def test_a_granted_user_skill_loads_without_loading_user_settings(tmp_path):
-    # With no setting sources the CLI never scans ~/.claude/skills — measured:
-    # skills=["qmd"] answered "Unknown skill: qmd". Loading "user" settings to
-    # fix that would bring the user's permissions and hooks with it.
     skills = tmp_path / "skills"
     (skills / "qmd" / "references").mkdir(parents=True)
     (skills / "qmd" / "SKILL.md").write_text("---\nname: qmd\n---\n")
@@ -554,8 +548,7 @@ def test_a_granted_user_skill_loads_without_loading_user_settings(tmp_path):
     assert (shim / "skills" / "qmd").resolve() == (skills / "qmd").resolve()
     assert not (shim / "skills" / "other").exists(), "only the granted skill is served"
 
-    # The skill's own files are readable; its sibling is not, and the rest of
-    # the filesystem stays out.
+    # The granted skill's dir is readable; nothing else outside cwd is.
     (matcher,) = opts.hooks["PreToolUse"]
     hook = matcher.hooks[0]
 
@@ -593,15 +586,12 @@ def test_granted_plugins_skills_and_mcp_are_passed_and_allowed(tmp_path):
 
     assert opts.plugins == [{"type": "local", "path": str(plugin.resolve())}], opts.plugins
     assert opts.skills == ["fw-guru:crg"], opts.skills
-    # Still strict: only the named server, not the plugin's or the user's own.
     assert opts.mcp_servers == {"crg": server} and opts.strict_mcp_config is True
     assert "mcp__crg" in opts.allowed_tools, opts.allowed_tools
     assert opts.setting_sources == [], opts.setting_sources
 
 
 def test_inherit_loads_every_setting_source_including_local():
-    # With skills set the SDK defaults to user+project and drops
-    # settings.local.json — where the repo's own permissions usually live.
     opts = _options_for(orch.Extensions(inherit=True))
     assert opts.setting_sources == ["user", "project", "local"], opts.setting_sources
     assert opts.skills == "all", opts.skills
@@ -609,7 +599,6 @@ def test_inherit_loads_every_setting_source_including_local():
 
 
 def test_extensions_are_part_of_the_cache_key():
-    # A result computed with a skill must not be served to a run without it.
     async def fake(prompt, options):
         return message(structured_output={"skills": options.skills})
 
@@ -622,8 +611,6 @@ def test_extensions_are_part_of_the_cache_key():
 
 
 def test_extension_flags_survive_cli_forwarding(tmp_path):
-    # `pyflows research` re-parses through research.main; a flag dropped on
-    # the way runs the agents without the skill the user granted.
     import argparse
 
     config = tmp_path / "mcp.json"
@@ -640,3 +627,20 @@ def test_extension_flags_survive_cli_forwarding(tmp_path):
         skills=("a", "p:b"), plugins=("/x",), mcp={"crg": {"command": "crg"}}, inherit=True
     ), ext
     assert orch.extensions_from(parser.parse_args([])) == orch.NO_EXTENSIONS
+
+
+def test_agents_sharing_a_label_get_distinct_ones():
+    async def ok(prompt, options):
+        return message(structured_output={})
+
+    with patched(orch, "_run", ok):
+        asyncio.run(
+            gather([orch.ask(f"p{i}", {"type": "object"}, label="verify/x") for i in range(3)])
+        )
+        asyncio.run(orch.ask("other", {"type": "object"}, label="find/y"))
+
+    finished = [r["label"] for r in read_runs()[-1] if r.get("outcome") == "ok"]
+    assert sorted(finished) == ["find/y", "verify/x", "verify/x#2", "verify/x#3"], finished
+
+    orch.STATS.reset()
+    assert orch.STATS.unique("verify/x") == "verify/x"

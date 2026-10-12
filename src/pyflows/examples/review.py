@@ -107,7 +107,7 @@ async def review(
     `batch_size` None means one verifier per batch of BATCH_SIZE findings;
     pass a value >= the finding count to force a single verifier.
 
-    `ext` is what the agents may load beyond Read/Grep/Glob — nothing by default.
+    `ext` is what the agents may load beyond their tools.
     """
     batch_size = batch_size or BATCH_SIZE
     spend = _Spend(MAX_CALLS)
