@@ -269,6 +269,11 @@ These are the rules the tests exist to protect. Each one is a bug that shipped.
   `allowed_tools` approves the whole tool. (Measured: before the hook, one
   agent read, grepped and globbed a canary file outside `cwd`; after it, all
   three were denied, and reads inside `cwd` still worked.)
+- **Agents load no MCP servers, yours included.** `strict_mcp_config` with an
+  empty `mcp_servers` stops the CLI loading plugin servers, `~/.claude.json`
+  and project `.mcp.json`. (Measured: without it every agent loaded 5 servers
+  and 36 `mcp__` tools, some with side effects outside the repo; with it,
+  none.)
 - **One terminal record per agent, carrying that agent's usage.** Not the
   run's running totals — the panel sums the records, so totals made N equal
   calls read as N(N+1)/2 calls' worth. And exactly one: a schema retry or a

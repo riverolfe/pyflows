@@ -121,6 +121,24 @@ def test_ask_installs_the_confinement_hook_for_every_path_tool():
     assert set(matcher.matcher.split("|")) == {"Read", "Grep", "Glob"}, matcher.matcher
 
 
+def test_ask_loads_no_mcp_servers_not_even_the_users():
+    # The bug: agents inherited every MCP server the user had configured —
+    # measured live, 5 servers and 36 mcp__ tools, some with side effects
+    # outside the repo. strict_mcp_config is what stops the CLI loading its own.
+    captured = {}
+
+    async def fake_run(prompt, options):
+        captured["options"] = options
+        raise RuntimeError("stop here — we only inspect the options")
+
+    with patched(orch, "_run", fake_run):
+        asyncio.run(orch.ask("p", {"type": "object"}, use_cache=False))
+
+    opts = captured["options"]
+    assert opts.strict_mcp_config is True
+    assert opts.mcp_servers == {}, opts.mcp_servers
+
+
 def test_cache_key_separates_every_input_it_is_built_from():
     # Every one of these was a real collision or a stale-hit bug.
     base = ("p", {"t": 1}, ("Read",))
