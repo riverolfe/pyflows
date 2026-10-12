@@ -60,6 +60,67 @@ def test_ask_confines_cwd_and_drops_write_tools():
     assert opts.permission_mode == "dontAsk", opts.permission_mode
 
 
+def _hook_decision(root, tool, tool_input):
+    hook = orch._confine(root)
+    out = asyncio.run(hook({"tool_name": tool, "tool_input": tool_input}, None, None))
+    return out.get("hookSpecificOutput", {}).get("permissionDecision", "allow")
+
+
+def test_confinement_denies_every_route_out_of_cwd(tmp_path):
+    # The bug: cwd was the only boundary, and a bare "Read" in allowed_tools
+    # approves the whole tool — measured live, Read, Grep and Glob all returned
+    # a canary file outside cwd. Each of these is a different way out.
+    root = (tmp_path / "repo").resolve()
+    root.mkdir()
+    (root / "leak").symlink_to(tmp_path)  # a link in the repo pointing out of it
+    outside = str(tmp_path / "secret.env")
+
+    for tool, tool_input in [
+        ("Read", {"file_path": outside}),
+        ("Read", {"file_path": "../secret.env"}),
+        ("Read", {"file_path": "~/.ssh/id_rsa"}),
+        ("Read", {"file_path": "leak/secret.env"}),
+        ("Grep", {"pattern": "KEY", "path": str(tmp_path)}),
+        ("Glob", {"pattern": f"{tmp_path}/*.env"}),
+        ("Glob", {"pattern": "../*.env"}),
+        ("Glob", {"pattern": "*.env", "path": ".."}),
+        ("Glob", {"pattern": "../../*", "path": "src"}),
+        ("Glob", {"pattern": "src/*/../../../*.env"}),  # inside prefix, climbs out
+    ]:
+        assert _hook_decision(root, tool, tool_input) == "deny", (tool, tool_input)
+
+
+def test_confinement_allows_everything_inside_cwd(tmp_path):
+    # Over-blocking is its own failure: a review that cannot read the repo
+    # returns "no findings" — the dead-run-reads-as-clean shape again.
+    root = tmp_path.resolve()
+    (root / "src").mkdir()
+    for tool, tool_input in [
+        ("Read", {"file_path": "src/app.py"}),
+        ("Read", {"file_path": str(root / "src" / "app.py")}),
+        ("Grep", {"pattern": "x"}),  # no path: searches cwd
+        ("Glob", {"pattern": "**/*.py"}),
+        ("Glob", {"pattern": "*.py", "path": "src"}),
+        ("Glob", {"pattern": "../*.py", "path": "src"}),  # relative to path: still root
+        ("WebFetch", {"url": "https://example.com"}),  # not a path tool
+    ]:
+        assert _hook_decision(root, tool, tool_input) == "allow", (tool, tool_input)
+
+
+def test_ask_installs_the_confinement_hook_for_every_path_tool():
+    captured = {}
+
+    async def fake_run(prompt, options):
+        captured["options"] = options
+        raise RuntimeError("stop here — we only inspect the options")
+
+    with patched(orch, "_run", fake_run):
+        asyncio.run(orch.ask("p", {"type": "object"}, use_cache=False))
+
+    (matcher,) = captured["options"].hooks["PreToolUse"]
+    assert set(matcher.matcher.split("|")) == {"Read", "Grep", "Glob"}, matcher.matcher
+
+
 def test_cache_key_separates_every_input_it_is_built_from():
     # Every one of these was a real collision or a stale-hit bug.
     base = ("p", {"t": 1}, ("Read",))

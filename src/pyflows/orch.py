@@ -16,7 +16,7 @@ from typing import Any
 
 import diskcache
 import jsonschema
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, ResultMessage, query
 
 # Each query() spawns a CLI subprocess. Without this cap, fan-out is unbounded.
 GATE = asyncio.Semaphore(8)
@@ -298,6 +298,58 @@ def cache_key(
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
+# The tools that take a filesystem path, and the input fields holding one.
+PATH_TOOLS = {"Read": ("file_path",), "Grep": ("path",), "Glob": ("path", "pattern")}
+
+
+def _escapes(root: Path, tool: str, tool_input: dict) -> str | None:
+    """The first path in `tool_input` that resolves outside `root`, else None."""
+    base = root
+    for field in PATH_TOOLS.get(tool, ()):
+        value = tool_input.get(field)
+        if not value:
+            continue
+        # resolve() follows symlinks: a link in the repo pointing at ~/.ssh
+        # resolves outside root and is denied, not read through. A Glob pattern
+        # is resolved whole, not cut at its first wildcard: "src/*/../../x" has
+        # an inside prefix and still climbs out — wildcard segments resolve as
+        # plain names, so the ".." after them is counted.
+        target = (base / Path(value).expanduser()).resolve()
+        if not target.is_relative_to(root):
+            return str(value)
+        if field == "path":
+            base = target  # Glob's pattern is relative to its path
+    return None
+
+
+def _confine(root: Path):
+    """PreToolUse hook: deny Read/Grep/Glob on any path outside `root`.
+
+    The boundary cwd alone is not. A bare "Read" in allowed_tools approves the
+    whole tool before can_use_tool is consulted, so absolute paths walked
+    straight out — measured live: Read, Grep and Glob all returned a canary
+    file outside cwd. A PreToolUse hook runs before that approval.
+    """
+
+    async def hook(input_data: Any, _tool_use_id: str | None, _context: Any) -> dict:
+        tool = input_data.get("tool_name", "")
+        escaped = _escapes(root, tool, input_data.get("tool_input") or {})
+        if escaped is None:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"{tool} on {escaped} is outside the working directory {root}; "
+                    f"only files under it may be read."
+                ),
+            }
+        }
+
+    return hook
+
+
 async def ask(
     prompt: str,
     schema: dict,
@@ -331,13 +383,11 @@ async def ask(
     money is not a run with a dead stage, and reporting it as one sends you
     looking at the wrong thing.
 
-    `cwd` sets the agent's working directory and disallowed_tools drops the
-    write/exec surface. That is not a jail: Read still accepts absolute paths,
-    so an agent can reach ~/.aws/credentials or a .env. ponytail: cwd + a
-    read-only tool list covers the accidental case; for a real boundary use a
-    PreToolUse hook — can_use_tool is NOT consulted for a bare "Read" entry in
-    `tools`, because an allowed_tools entry without a specifier auto-approves
-    the whole tool before the callback runs.
+    `cwd` sets the agent's working directory, disallowed_tools drops the
+    write/exec surface, and a PreToolUse hook (`_confine`) denies Read, Grep
+    and Glob on any path that resolves outside `cwd` — absolute, `..`, `~` or
+    a symlink. Web tools are not confined: an agent given WebFetch can still
+    send what it read under `cwd` to a URL.
     """
     key = cache_key(
         prompt,
@@ -368,6 +418,9 @@ async def ask(
         cwd=root,
         permission_mode="dontAsk",
         max_budget_usd=max_budget_usd,
+        hooks={
+            "PreToolUse": [HookMatcher(matcher="|".join(PATH_TOOLS), hooks=[_confine(Path(root))])]
+        },
     )
     try:
         async with GATE:
