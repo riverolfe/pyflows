@@ -296,7 +296,14 @@ owner:
 | `test_research.py` | the research example — sweep blindness, citation checking |
 | `test_upgrade.py` | the upgrade example — runtime fan-out width, budget capping, refutation |
 | `test_decide.py` | the decide example — bracket cost, dead judges, the no-progress guard, `--max`, presented-vs-argument order |
-| `conftest.py` | the shared fakes (`patched`, `message`, `FINDING`) |
+| `conftest.py` | the shared fakes (`patched`, `message`, `FINDING`), and test isolation |
+
+Tests never touch your real cache or run log. `conftest.py` points
+`PYFLOWS_CACHE` and `PYFLOWS_RUN_LOG` at a temp dir *before* importing
+`pyflows.orch` — `CACHE` is opened at import time, so a fixture alone is too
+late — and gives every test an empty cache and its own run log. The fixture
+refuses to clear a cache outside that temp dir, so a broken redirect errors
+every test instead of wiping `~/.cache/pyflows`.
 
 To decide whether a test earns its place, break the thing it covers and check
 that it fails. A test that survives the mutation is decoration:
