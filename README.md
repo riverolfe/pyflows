@@ -52,6 +52,11 @@ pyflows upgrade . --depth 5      # verify 5 candidate breaks instead of 3
 pyflows decide "which queue?" redis rabbitmq kafka   # pick by tournament
 pyflows decide "q" "a" "b" --max 4  # enter only the first 4 options
 
+# Agents load no skills, plugins or settings unless the run names them:
+pyflows research "q" --skill qmd --mcp-config qmd.json  # a user skill + its server
+pyflows review fw --plugin ~/plugins/fw-guru --skill fw-guru:crg-vhdl
+pyflows review . --inherit-settings  # everything Claude Code would load — trusted repos only
+
 pyflows agents -n 3             # browse past runs
 pyflows agents --json           # raw records
 pyflows watch                   # live panel while a run is in flight
@@ -274,6 +279,30 @@ These are the rules the tests exist to protect. Each one is a bug that shipped.
   and project `.mcp.json`. (Measured: without it every agent loaded 5 servers
   and 36 `mcp__` tools, some with side effects outside the repo; with it,
   none.)
+- **Agents load no settings: not yours, and not the reviewed repo's.**
+  `setting_sources=[]`. By default the CLI loads user, project and local
+  settings from `cwd`, so the repo under review set its own reviewers'
+  permissions, and could add hooks, which are shell commands. (Measured in a
+  repo whose `.claude/settings.local.json` allowed `WebSearch`: a
+  Read/Grep/Glob agent ran a web search and saw about 110 skills. With no
+  sources, the search was denied and only built-in skills were listed.)
+- **Skills, plugins and MCP servers are granted per workflow, by name.**
+  `ask(..., ext=Extensions(skills=..., plugins=..., mcp=...))`, or `--skill`,
+  `--plugin` and `--mcp-config` on the CLI. A plugin's own MCP servers are not
+  loaded; pass them in `mcp`, and their `mcp__<name>` tools are allowed. A bare
+  skill name is a user skill. With no settings loaded, the CLI never scans
+  `~/.claude/skills` (measured: "Unknown skill: qmd"), so the granted skills
+  are linked into a local plugin, `pyflows-user`, under the cache dir. The
+  confinement hook also lets agents read the granted skill and plugin dirs,
+  because a skill's instructions point at its own references. A skill or
+  plugin that does not exist stops the run instead of producing a dead agent.
+  `Extensions(inherit=True)` (`--inherit-settings`) loads all three setting
+  sources, every skill and the user's MCP servers, whose tools still run only
+  where those settings allow them. Use it only for repos you trust. (Measured
+  live in one repo: by default, no web search and only built-in skills. With
+  `--skill qmd` plus its server, the skill loaded, read its own references and
+  searched the index. With inherit, the web search succeeded and about 110
+  skills were listed.)
 - **One terminal record per agent, carrying that agent's usage.** Not the
   run's running totals — the panel sums the records, so totals made N equal
   calls read as N(N+1)/2 calls' worth. And exactly one: a schema retry or a
@@ -364,6 +393,14 @@ run `pytest`, which uses fakes.
   `cwd` is readable, `.env` files included, and an agent that also holds
   `WebFetch` (every `upgrade` agent) can still send what it read to a URL.
   Point `upgrade` only at repos you trust.
+- Agents can start subagents with `Agent`, even though it is not in `tools`. A
+  subagent stays under the same confinement hook (measured: a subagent's Glob
+  outside `cwd` was denied), but each one is another model call that
+  `MAX_CALLS` does not count.
+- Most plugin skills assume Bash, which pyflows denies. A skill can load and
+  still not run its main route. Measured: a code-graph skill whose main route
+  is a script could reach the graph only through its MCP server. That server
+  cannot tell callers from callees, and the agent got the direction wrong.
 - `can_use_tool` would not have worked as the boundary. An `allowed_tools`
   entry with no specifier — `"Read"`, which is what pyflows sends —
   auto-approves the whole tool *before* the callback is consulted, so the

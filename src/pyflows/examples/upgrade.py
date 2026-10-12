@@ -20,7 +20,20 @@ import asyncio
 import time
 from pathlib import Path
 
-from ..orch import MAX_CALLS, STATS, BudgetExhausted, _log_run, _Spend, ask, gather
+from ..orch import (
+    MAX_CALLS,
+    NO_EXTENSIONS,
+    STATS,
+    BudgetExhausted,
+    ExtensionError,
+    Extensions,
+    _log_run,
+    _Spend,
+    add_extension_args,
+    ask,
+    extensions_from,
+    gather,
+)
 
 # Manifests we know how to read, in the order we prefer them. First hit wins —
 # a repo can carry several (a monorepo root with a nested package).
@@ -141,7 +154,7 @@ def _pick(deps: list[dict], limit: int | None) -> list[dict]:
     return ranked[:limit] if limit else ranked
 
 
-async def inventory(target: str, spend: _Spend) -> list[dict]:
+async def inventory(target: str, spend: _Spend, ext: Extensions = NO_EXTENSIONS) -> list[dict]:
     """One agent reads the manifest. This is what sets the fan-out width."""
     found = await ask(
         f"In {target}, find the dependency manifest and list its dependencies.\n\n"
@@ -152,6 +165,7 @@ async def inventory(target: str, spend: _Spend) -> list[dict]:
         INVENTORY,
         tools=TOOLS,
         spend=spend,
+        ext=ext,
         cwd=target,
         depends_on=target,
         label="inventory",
@@ -167,12 +181,13 @@ async def upgrade(
     limit: int | None = None,
     depth: int = 3,
     verify: bool = True,
+    ext: Extensions = NO_EXTENSIONS,
 ) -> dict:
     """Audit what upgrading this repo's dependencies would break. Returns a brief."""
     spend = _Spend(MAX_CALLS)
     started = time.monotonic()
 
-    deps = _pick(await inventory(target, spend), limit)
+    deps = _pick(await inventory(target, spend, ext), limit)
     if not deps:
         raise UpgradeFailed("manifest listed no dependencies")
 
@@ -206,6 +221,7 @@ async def upgrade(
                 BREAKING,
                 tools=TOOLS,
                 spend=spend,
+                ext=ext,
                 cwd=target,
                 depends_on=target,
                 label=f"dep/{d['name']}"[:32],
@@ -299,6 +315,7 @@ async def upgrade(
                 VERDICTS,
                 tools=TOOLS,
                 spend=spend,
+                ext=ext,
                 cwd=target,
                 depends_on=target,
                 label=f"verify/{batch[0]['dependency']}:{len(batch)}"[:32],
@@ -380,6 +397,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=None, help="max dependencies to audit")
     parser.add_argument("--depth", type=int, default=3, help="candidate breaks to verify")
     parser.add_argument("--no-verify", action="store_true", help="skip verification")
+    add_extension_args(parser)
     args = parser.parse_args(argv)
 
     target = Path(args.target)
@@ -403,8 +421,10 @@ def main(argv: list[str] | None = None) -> int:
         }
     )
     try:
-        brief = asyncio.run(upgrade(str(target), args.limit, args.depth, not args.no_verify))
-    except (UpgradeFailed, BudgetExhausted) as exc:
+        brief = asyncio.run(
+            upgrade(str(target), args.limit, args.depth, not args.no_verify, extensions_from(args))
+        )
+    except (UpgradeFailed, BudgetExhausted, ExtensionError) as exc:
         print(f"upgrade audit did not complete: {exc}\n{STATS.summary()}")
         return 1
 

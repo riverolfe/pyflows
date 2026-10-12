@@ -17,11 +17,17 @@ from pathlib import Path
 
 from ..orch import (
     MAX_CALLS,
+    NO_EXTENSIONS,
     STATS,
     BudgetExhausted,
+    ExtensionError,
+    Extensions,
     _log_run,
     _Spend,
+    add_extension_args,
     ask,
+    extension_argv,
+    extensions_from,
     gather,
 )
 from ..panel import show_agents, watch
@@ -91,6 +97,7 @@ async def review(
     target: str,
     lenses: tuple[str, ...] = LENSES,
     batch_size: int | None = None,
+    ext: Extensions = NO_EXTENSIONS,
 ) -> dict:
     """Return {"confirmed": findings that survived, "unconfirmed": count never judged}.
 
@@ -99,6 +106,8 @@ async def review(
 
     `batch_size` None means one verifier per batch of BATCH_SIZE findings;
     pass a value >= the finding count to force a single verifier.
+
+    `ext` is what the agents may load beyond Read/Grep/Glob — nothing by default.
     """
     batch_size = batch_size or BATCH_SIZE
     spend = _Spend(MAX_CALLS)
@@ -110,6 +119,7 @@ async def review(
                 f"point at in a specific file and line.",
                 FINDINGS,
                 spend=spend,
+                ext=ext,
                 cwd=target,
                 depends_on=target,
                 label=f"find/{lens}",
@@ -157,6 +167,7 @@ async def review(
                 BATCH,
                 tools=("Read", "Grep"),
                 spend=spend,
+                ext=ext,
                 cwd=target,
                 depends_on=target,
                 label=f"verify/{batch[0]['file']}:{len(batch)}",
@@ -205,6 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         help="one lens, one verifier — cheap, but no independent cross-check",
     )
     rev.add_argument("--lenses", type=int, default=None, help="limit finder agents")
+    add_extension_args(rev)
 
     ag = sub.add_parser("agents", help="browse agents from past runs")
     ag.add_argument("-n", "--last", type=int, default=1, help="how many runs back")
@@ -218,17 +230,20 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("--angles", type=int, default=None, help="limit search angles")
     rs.add_argument("--depth", type=int, default=3, help="citations to verify")
     rs.add_argument("--no-verify", action="store_true", help="skip citation checking")
+    add_extension_args(rs)
 
     up = sub.add_parser("upgrade", help="audit dependency upgrades against a repo")
     up.add_argument("target", nargs="?", default=".")
     up.add_argument("--limit", type=int, default=None, help="max dependencies to audit")
     up.add_argument("--depth", type=int, default=3, help="candidate breaks to verify")
     up.add_argument("--no-verify", action="store_true", help="skip verification")
+    add_extension_args(up)
 
     dc = sub.add_parser("decide", help="pick between options by tournament")
     dc.add_argument("question")
     dc.add_argument("options", nargs="+", help="two or more options to choose between")
     dc.add_argument("--max", type=int, default=None, help="cap the field size")
+    add_extension_args(dc)
 
     args = parser.parse_args(argv)
 
@@ -240,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
             # is not None: --max 0 is a request, and dropping it silently
             # runs a bigger tournament than the user asked for.
             + (["--max", str(args.max)] if args.max is not None else [])
+            + extension_argv(args)
         )
     if args.command == "agents":
         return show_agents(args.last, as_json=args.json)
@@ -252,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
             [args.target, "--depth", str(args.depth)]
             + (["--no-verify"] if args.no_verify else [])
             + (["--limit", str(args.limit)] if args.limit else [])
+            + extension_argv(args)
         )
     if args.command == "research":
         from .research import main as research_main
@@ -260,6 +277,7 @@ def main(argv: list[str] | None = None) -> int:
             ["research", args.question, "--depth", str(args.depth)]
             + (["--no-verify"] if args.no_verify else [])
             + (["--angles", str(args.angles)] if args.angles else [])
+            + extension_argv(args)
         )
 
     target = Path(args.target)
@@ -278,8 +296,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{mode}: {len(lenses)} lens{'es' if len(lenses) != 1 else ''} on {target}")
 
     try:
-        result = asyncio.run(review(str(target), lenses, batch_size))
-    except (ReviewFailed, BudgetExhausted) as exc:
+        result = asyncio.run(review(str(target), lenses, batch_size, extensions_from(args)))
+    except (ReviewFailed, BudgetExhausted, ExtensionError) as exc:
         print(f"review did not complete: {exc}\n{STATS.summary()}")
         return 1
 
