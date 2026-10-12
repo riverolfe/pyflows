@@ -8,7 +8,7 @@ import pyflows.examples.research as research
 from conftest import patched
 
 
-def test_research_does_not_pass_sources_through_unverified():
+def test_synthesizer_is_told_to_report_contradictions_not_resolve_them():
     # The synthesizer's job is to report disagreement, not to pick a winner.
     captured = {}
 
@@ -123,5 +123,4 @@ def test_verify_prompt_states_the_actual_assertion():
     with patched(research, "ask", fake):
         asyncio.run(research.research("q", depth=1))
 
-    assert seen and "uv ships 3.14t builds" in seen[0]
-    assert "Claim: uv ships 3.14t builds" in seen[0], seen[0]
+    assert seen and "Claim: uv ships 3.14t builds" in seen[0], seen

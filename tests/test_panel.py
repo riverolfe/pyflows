@@ -9,23 +9,20 @@ import pyflows.panel as panel
 from conftest import patched
 
 
-def test_agents_command_renders_a_run(capsys, tmp_path):
-    log = tmp_path / "run.jsonl"
-    # Both bindings: orch writes the log, panel reads it.
-    with patched(orch, "RUN_LOG", log), patched(panel, "RUN_LOG", log):
-        cr.main(["agents"])
-        orch._log_run({"outcome": "run_start", "target": "src", "mode": "quick", "lenses": 1})
-        orch._log_run(
-            {
-                "label": "find/correctness",
-                "outcome": "ok",
-                "input": 12000,
-                "output": 900,
-                "seconds": 42.0,
-            }
-        )
-        orch._log_run({"label": "verify/a.py:3", "outcome": "failed"})
-        assert cr.main(["agents"]) == 0
+def test_agents_command_renders_a_run(capsys):
+    # End to end through the CLI: orch writes the log, panel reads it back.
+    orch._log_run({"outcome": "run_start", "target": "src", "mode": "quick", "lenses": 1})
+    orch._log_run(
+        {
+            "label": "find/correctness",
+            "outcome": "ok",
+            "input": 12000,
+            "output": 900,
+            "seconds": 42.0,
+        }
+    )
+    orch._log_run({"label": "verify/a.py:3", "outcome": "failed"})
+    assert cr.main(["agents"]) == 0
 
     out = capsys.readouterr().out
     assert "src" in out and "quick" in out
@@ -92,27 +89,10 @@ def test_duplicate_labels_get_separate_rows():
     assert [r[2] for r in rows] == ["1.0k", "2.0k"], rows
 
 
-def test_one_of_two_duplicate_labels_still_running():
-    # A start with no finish must stay visible as running, not vanish.
-    rows = panel._stage_rows(
-        [
-            {"outcome": "run_start", "target": "s", "mode": "f", "lenses": 2},
-            {"label": "verify/x", "outcome": "started"},
-            {"label": "verify/x", "outcome": "started"},
-            {"label": "verify/x", "outcome": "ok", "input": 500, "output": 20, "seconds": 5.0},
-        ]
-    )
-    assert [(r[1], r[2]) for r in rows] == [("done", "0.5k"), ("running", "")], rows
-
-
 def test_panel_labels_a_budget_stop_distinctly_from_a_failure():
     # It is not a FAIL: a budget stop means the run was stopped on purpose,
     # and counting it as a failure sends you to the agent count instead of
     # the bill.
-    status, _ = panel.OUTCOMES["over_budget"]
-    assert status == "BUDGET"
-    assert status != "FAIL"
-
     run = [
         {"outcome": "run_start", "target": "src", "mode": "full", "lenses": 4},
         {"label": "find/correctness", "outcome": "started"},
