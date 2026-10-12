@@ -281,6 +281,26 @@ def test_ask_does_not_serve_a_cached_result_for_changed_sources(tmp_path):
     assert len(calls) == 2, "edited sources must invalidate the cache"
 
 
+def test_ask_strips_terminal_control_characters_from_model_output():
+    # Model output is derived from untrusted repos and web pages and printed
+    # raw: an ESC sequence in a finding's summary can clear the screen or
+    # rewrite earlier lines, a bidi override can reverse what a line says.
+    # Cleaned once in ask(), cached result included, so no workflow forgets.
+    async def hostile(prompt, options):
+        return message(structured_output={"s": ["ok\x1b[2J\r\u202eevil", "line\nnext\tcol"]})
+
+    with patched(orch, "_run", hostile):
+        out = asyncio.run(orch.ask("p", {"type": "object"}))
+        cached = asyncio.run(orch.ask("p", {"type": "object"}))
+
+    assert out == cached == {"s": ["ok[2Jevil", "line\nnext\tcol"]}, out
+
+    # An entry cached before cleaning existed is cleaned on the way out too.
+    key = cache_key("q", {"type": "object"}, ("Read", "Grep", "Glob"), "", ".", "")
+    orch.CACHE.set(key, {"s": "old\x1b[2J"})
+    assert asyncio.run(orch.ask("q", {"type": "object"})) == {"s": "old[2J"}
+
+
 def test_ask_returns_none_rather_than_an_invalid_payload():
     # The SDK hands back structured_output unvalidated; an invalid payload used
     # to be indistinguishable from a dead agent.
