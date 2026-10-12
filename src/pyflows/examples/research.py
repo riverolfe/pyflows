@@ -176,12 +176,16 @@ async def research(
     if not alive:
         raise ResearchFailed(f"all {len(angles)} search angles failed")
 
-    claims = []
+    claims, dropped = [], 0
     for group in alive:
         for f in group.get("findings", []):
+            # The synthesizer would cite "(source: , …)" — a claim it cannot
+            # source is one the citation check below can never catch.
+            if not f.get("url"):
+                dropped += 1
+                continue
             claims.append((f["claim"], f["url"], f.get("confidence", "low")))
 
-    dropped = sum(1 for g in alive for f in g.get("findings", []) if not f.get("url"))
     if dropped:
         print(f"  {dropped} claims had no URL and cannot be verified — dropped")
 
@@ -206,7 +210,14 @@ async def research(
     if brief is None:
         raise ResearchFailed("synthesis failed")
 
-    result = {**brief, "verified": None, "unsupported": [], "angles_alive": len(alive)}
+    result = {
+        **brief,
+        "verified": None,
+        "unsupported": [],
+        # Citations whose verifier died: neither held up nor refuted.
+        "unchecked": [],
+        "angles_alive": len(alive),
+    }
 
     if not verify:
         result["elapsed"] = time.monotonic() - started
@@ -236,13 +247,20 @@ async def research(
         ]
     )
 
+    # The bug: a dead verifier (None) was kept as "unsupported", then v.get()
+    # crashed the run. A dead verifier checked nothing — it is unchecked.
+    pairs = list(zip(targets, verdicts, strict=True))
+    unchecked = [{"claim": c, "url": u} for (c, u), v in pairs if v is None]
     unsupported = [
         {"claim": c, "url": u, "why": v.get("reason", "")}
-        for (c, u), v in zip(targets, verdicts, strict=True)
-        if v is None or not v.get("supported")
+        for (c, u), v in pairs
+        if v is not None and not v.get("supported")
     ]
-    result["verified"] = len(targets) - len(unsupported)
+    if targets and len(unchecked) == len(targets):
+        raise ResearchFailed(f"all {len(targets)} citation checks failed")
+    result["verified"] = len(targets) - len(unsupported) - len(unchecked)
     result["unsupported"] = unsupported
+    result["unchecked"] = unchecked
     result["elapsed"] = time.monotonic() - started
     return result
 
@@ -265,7 +283,12 @@ def render(brief: dict) -> None:
         print(f"\nUnsupported citations ({len(brief['unsupported'])}):")
         for bad in brief["unsupported"]:
             print(f"  ✗ {bad['url']}\n    {bad['claim']}\n    {bad['why']}")
-    if brief.get("verified") is not None and not brief["unsupported"]:
+    unchecked = brief.get("unchecked") or []
+    if unchecked:
+        print(f"\nCitations NOT checked ({len(unchecked)}) — their verifier did not answer:")
+        for c in unchecked:
+            print(f"  ? {c['url']}\n    {c['claim']}")
+    if brief.get("verified") is not None and not brief["unsupported"] and not unchecked:
         print(f"\nAll {brief['verified']} checked citations held up.")
 
 
@@ -296,7 +319,8 @@ def main(argv: list[str] | None = None) -> int:
     render(brief)
     print(f"\n{STATS.summary()}")
     print(f"wall clock: {brief['elapsed']:.0f}s")
-    return 0
+    # A citation nobody checked is not one that held up.
+    return 1 if brief.get("unchecked") else 0
 
 
 if __name__ == "__main__":

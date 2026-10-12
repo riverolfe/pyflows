@@ -80,6 +80,73 @@ def test_research_flags_unsupported_citations():
     assert out["unsupported"][0]["why"] == "checked"
 
 
+def _brief_with_sources(*urls):
+    return {
+        "answer": "a",
+        "agreements": [],
+        "contradictions": [],
+        "gaps": [],
+        "sources": [{"claim": f"claim from {u}", "url": u} for u in urls],
+    }
+
+
+def test_a_dead_citation_check_is_unchecked_not_a_crash(capsys):
+    # The bug: a verifier that died was kept as "unsupported", then
+    # v.get("reason") on None raised AttributeError and lost the whole brief.
+    async def fake(prompt, schema, **kw):
+        if "Synthesize" in prompt:
+            return _brief_with_sources("http://a", "http://b")
+        if "actually support" in prompt:
+            return None if "http://a" in prompt else {"supported": True, "reason": "ok"}
+        return {"findings": []}
+
+    with patched(research, "ask", fake):
+        out = asyncio.run(research.research("q", depth=2))
+        code = research.main(["research", "q", "--depth", "2"])
+
+    assert [c["url"] for c in out["unchecked"]] == ["http://a"], out
+    assert out["unsupported"] == [] and out["verified"] == 1, out
+    assert code == 1, "a citation nobody checked is not one that held up"
+    text = capsys.readouterr().out
+    assert "NOT checked" in text and "held up" not in text, text
+
+
+def test_every_citation_check_dead_is_not_a_clean_run():
+    async def fake(prompt, schema, **kw):
+        if "Synthesize" in prompt:
+            return _brief_with_sources("http://a")
+        if "actually support" in prompt:
+            return None
+        return {"findings": []}
+
+    with patched(research, "ask", fake), pytest.raises(research.ResearchFailed):
+        asyncio.run(research.research("q", depth=1))
+
+
+def test_claims_without_a_url_never_reach_the_synthesizer(capsys):
+    # The bug: they were counted as "dropped" and then passed on anyway, so
+    # the synthesizer cited "(source: , …)" for a claim nothing could check.
+    captured = {}
+
+    async def fake(prompt, schema, **kw):
+        if "Synthesize" in prompt:
+            captured["prompt"] = prompt
+            return _brief_with_sources()
+        return {
+            "findings": [
+                {"claim": "sourced", "url": "http://a", "confidence": "high"},
+                {"claim": "unsourced", "url": "", "confidence": "high"},
+            ]
+        }
+
+    with patched(research, "ask", fake):
+        asyncio.run(research.research("q", angles=research.ANGLES[:1], verify=False))
+
+    assert "sourced (source: http://a" in captured["prompt"]
+    assert "unsourced" not in captured["prompt"], captured["prompt"]
+    assert "1 claims had no URL" in capsys.readouterr().out
+
+
 def test_citations_carry_a_real_claim_not_a_bare_url():
     # The bug this fixes: sources used to be bare URLs, so the verifier was
     # handed (url, url) and could only report "this page exists".

@@ -58,7 +58,9 @@ pyflows watch                   # live panel while a run is in flight
 ```
 
 Every command exits non-zero when the run did not complete — a dead run never
-reports "clean".
+reports "clean". So does a run that finished with work nobody checked: a review
+finding no verifier judged, a citation whose checker died, a candidate break
+left unverified. A partial answer is reported as partial.
 
 ## Four example workflows
 
@@ -216,6 +218,12 @@ These are the rules the tests exist to protect. Each one is a bug that shipped.
   and `pyflows upgrade` exits non-zero rather than print "safe to bump".
   (Observed: a run that spent 0.41M tokens and 917s reporting "0 breaks" while
   every WebFetch silently failed.)
+- **An unverified claim is not a refuted one.** A candidate break whose verifier
+  died or skipped it, one beyond `--depth`, or any under `--no-verify` is
+  `unconfirmed`, never `refuted`. "Safe to bump" is printed only when nothing
+  is confirmed, unchecked or unconfirmed; otherwise `upgrade` exits non-zero.
+  The same rule holds in `review` (unjudged findings) and `research` (a
+  citation whose checker died is `unchecked`, not `unsupported`).
 - **A dead run never exits clean.** Every lens dead, or every verifier dead,
   raises. Otherwise "reviewed nothing" reads as "found nothing". The converse
   holds too: live lenses that found nothing is a clean review, and exits 0 —
