@@ -387,7 +387,8 @@ async def ask(
     write/exec surface, and a PreToolUse hook (`_confine`) denies Read, Grep
     and Glob on any path that resolves outside `cwd` — absolute, `..`, `~` or
     a symlink. Web tools are not confined: an agent given WebFetch can still
-    send what it read under `cwd` to a URL.
+    send what it read under `cwd` to a URL. No MCP servers are loaded, the
+    user's own included (`strict_mcp_config`).
     """
     key = cache_key(
         prompt,
@@ -418,6 +419,12 @@ async def ask(
         cwd=root,
         permission_mode="dontAsk",
         max_budget_usd=max_budget_usd,
+        # No MCP servers: without this every agent loaded the user's own —
+        # plugin servers, ~/.claude.json, project .mcp.json. Measured: 5 servers
+        # and 36 mcp__ tools per agent, some with side effects outside the repo.
+        # dontAsk denies them, but they sat in every agent's context.
+        mcp_servers={},
+        strict_mcp_config=True,
         hooks={
             "PreToolUse": [HookMatcher(matcher="|".join(PATH_TOOLS), hooks=[_confine(Path(root))])]
         },
