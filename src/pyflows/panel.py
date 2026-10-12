@@ -74,16 +74,21 @@ def _render(run: list[dict]) -> str:
     # over a bracket field. Same field, different word — calling angles
     # "lenses" reads as a bug.
     count = start.get("lenses", "?")
-    noun = {"research": "angle", "quick": "lens", "decide": "option"}.get(mode, "lens")
-    if count != 1:
-        noun += "s"
+    one, many = {
+        "research": ("angle", "angles"),
+        "decide": ("option", "options"),
+        "upgrade": ("dependency", "dependencies"),
+    }.get(mode, ("lens", "lenses"))
+    # Upgrade logs no count: its fan-out width is not known until the
+    # inventory lands. "None lenss" was what that rendered as.
+    fanout = f", {count} {one if count == 1 else many}" if count is not None else ""
     target = start.get("target", "?")
     # Questions are long and arbitrary; paths are short. Truncate the question.
     if mode == "research" and len(target) > 58:
         target = target[:57] + "…"
     rows = _stage_rows(run)
     lines = [
-        f"{target}  [{mode}, {count} {noun}]",
+        f"{target}  [{mode}{fanout}]",
         f"{'stage':<{STAGE_COL}} {'status':<8} {'in':>8} {'out':>7} {'sec':>6}",
     ]
     for label, status, tok_in, tok_out, secs in rows:
