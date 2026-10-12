@@ -191,3 +191,24 @@ def test_verify_prompt_states_the_actual_assertion():
         asyncio.run(research.research("q", depth=1))
 
     assert seen and "Claim: uv ships 3.14t builds" in seen[0], seen
+
+
+def test_citation_check_labels_keep_the_end_of_the_source():
+    labels = []
+
+    async def fake(prompt, schema, **kw):
+        if "Synthesize" in prompt:
+            return _brief_with_sources(
+                "file:///home/user/repo/fwlibs/anc-lib/doc/parser.md",
+                "file:///home/user/repo/fwlibs/video-lib/doc/vpid.md",
+            )
+        if "actually support" in prompt:
+            labels.append(kw["label"])
+            return {"supported": True, "reason": "ok"}
+        return {"findings": []}
+
+    with patched(research, "ask", fake):
+        asyncio.run(research.research("q", depth=2))
+
+    assert len(set(labels)) == 2, labels
+    assert labels[0].endswith("doc/parser.md") and labels[1].endswith("doc/vpid.md"), labels

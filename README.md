@@ -423,6 +423,6 @@ run `pytest`, which uses fakes.
   not go read the repo, so "which library should we use?" is decided on what the
   question says rather than on what this codebase actually does. Put the
   relevant facts in the question, or pass the repo's context in it.
-- Stage labels are unique by convention, not by construction. If a workflow
-  ever emits two agents sharing a label, the panel merges them again — the run
-  log keeps both records, only the display does.
+- Stage labels are made unique by `ask()`: a repeated label gets `#2`, `#3`.
+  Distinct, not necessarily informative. A workflow that labels every agent
+  the same gets `verify#2` rather than the source it checked.

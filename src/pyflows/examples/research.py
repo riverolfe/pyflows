@@ -247,9 +247,8 @@ async def research(
                 tools=WEB,
                 spend=spend,
                 ext=ext,
-                # Host + tail of the path, sized to fit the panel.STAGE_COL
-                # column alongside the "verify/" prefix.
-                label=f"verify/{url.split('//')[-1][:25]}",
+                # The source's last 25 chars, to fit panel.STAGE_COL.
+                label=f"verify/{url.split('//')[-1][-25:]}",
                 system="You check citations. Default to unsupported.",
             )
             for claim, url in targets

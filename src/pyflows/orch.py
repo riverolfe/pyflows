@@ -124,6 +124,14 @@ class Stats:
         self.cache_write = 0
         self.cost_usd = 0.0
         self.seconds = 0.0
+        self.labels: dict[str, int] = {}  # times each label was handed out
+
+    def unique(self, label: str) -> str:
+        """`label`, or `label#n` for the n-th use of it this run."""
+        if not label:
+            return label
+        n = self.labels[label] = self.labels.get(label, 0) + 1
+        return label if n == 1 else f"{label}#{n}"
 
     def record(self, result: ResultMessage) -> dict:
         """Add one call's usage to the run totals and return that call's usage.
@@ -327,7 +335,7 @@ def cache_key(
     # Explicit fields, not a merged tuple — a system prompt concatenated onto
     # tools can collide with a different tools tuple.
     fields = [prompt, schema, sorted(tools), system, cwd, depends_on]
-    if extensions:  # appended only when set, so keys cached before it stay valid
+    if extensions:
         fields.append(extensions)
     blob = json.dumps(fields, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
@@ -338,11 +346,7 @@ PATH_TOOLS = {"Read": ("file_path",), "Grep": ("path",), "Glob": ("path", "patte
 
 
 def _escapes(root: Path, tool: str, tool_input: dict, also: tuple[Path, ...] = ()) -> str | None:
-    """The first path in `tool_input` outside `root` and every `also` dir, else None.
-
-    `also` holds the granted skill and plugin dirs: a skill's SKILL.md tells
-    the agent to read its own references, which live outside the repo.
-    """
+    """The first path in `tool_input` outside `root` and every `also` dir, else None."""
     base = root
     for field in PATH_TOOLS.get(tool, ()):
         value = tool_input.get(field)
@@ -390,30 +394,17 @@ def _confine(root: Path, also: tuple[Path, ...] = ()):
 
 
 USER_SKILLS = Path("~/.claude/skills").expanduser()
-# The plugin name user skills are served under. See _user_skill_plugin().
 SHIM_PLUGIN = "pyflows-user"
 
 
 @dataclass(frozen=True)
 class Extensions:
-    """What an agent may load beyond its `tools`. Empty unless a workflow says so.
+    """What an agent may load beyond its `tools`. Empty by default.
 
-    Without this, every agent loaded the settings of the user AND of the repo
-    under review: measured live in a repo whose .claude/settings.local.json
-    allowed WebSearch, a Read/Grep/Glob agent ran a web search, saw ~110
-    skills and could invoke plugin skills. A reviewed repo widening its own
-    reviewers' permissions — or adding hooks, which are shell commands — is
-    the failure this closes. So agents load no settings at all, and each
-    workflow names what it needs:
-
-    `skills`  — skill names. "plugin:skill" needs that plugin in `plugins`;
-                a bare name is a user skill from ~/.claude/skills.
-    `plugins` — local plugin dirs; their skills become loadable by name.
-    `mcp`     — MCP server configs by name, each with its `mcp__<name>` tools
-                allowed. A plugin's own servers are NOT loaded: pass them here.
-    `inherit` — load user, project and local settings as Claude Code itself
-                would: every skill, plugin, MCP server and permission they grant.
-                Only for a repo you trust; its settings decide what agents may do.
+    `skills`  — skill names: "plugin:skill", or a bare user skill name.
+    `plugins` — local plugin dirs.
+    `mcp`     — MCP server configs by name; their `mcp__<name>` tools are allowed.
+    `inherit` — load user, project and local settings, all skills and MCP servers.
     """
 
     skills: tuple[str, ...] = ()
@@ -434,14 +425,7 @@ NO_EXTENSIONS = Extensions()
 
 
 def _user_skill_plugin(names: tuple[str, ...]) -> Path:
-    """A local plugin dir serving user skills `names`, as `pyflows-user:<name>`.
-
-    With no setting sources the CLI never scans ~/.claude/skills — measured: a
-    bare skills=["qmd"] answered "Unknown skill: qmd". Loading "user" settings
-    to get it back would bring the user's permissions and hooks too. A plugin
-    is the one skill source that needs no settings, so the skills are linked
-    into one.
-    """
+    """A local plugin dir linking user skills `names`, served as `pyflows-user:<name>`."""
     missing = [n for n in names if not (USER_SKILLS / n / "SKILL.md").is_file()]
     if missing:
         raise ExtensionError(f"no such user skill in {USER_SKILLS}: {', '.join(missing)}")
@@ -540,7 +524,7 @@ def extensions_from(args: Any) -> Extensions:
 
 
 def extension_argv(args: Any) -> list[str]:
-    """The extension flags in `args`, back as argv — for a CLI that forwards."""
+    """The extension flags in `args`, as argv."""
     out = [a for s in args.skill for a in ("--skill", s)]
     out += [a for p in args.plugin for a in ("--plugin", p)]
     if args.mcp_config:
@@ -589,11 +573,10 @@ async def ask(
     and Glob on any path that resolves outside `cwd` — absolute, `..`, `~` or
     a symlink. Web tools are not confined: an agent given WebFetch can still
     send what it read under `cwd` to a URL. No MCP servers are loaded, the
-    user's own included (`strict_mcp_config`), and no settings: no skills,
-    plugins or permissions from the user or from the repo under `cwd`. `ext`
-    grants them back, explicitly — see Extensions.
+    user's own included, and no settings, skills or plugins. `ext` grants them.
     """
     ext_fields, ext_tools, ext_reads = _extension_options(ext)
+    label = STATS.unique(label)
     key = cache_key(
         prompt,
         schema,
@@ -624,12 +607,7 @@ async def ask(
         cwd=root,
         permission_mode="dontAsk",
         max_budget_usd=max_budget_usd,
-        # No MCP servers unless `ext` names them: without this every agent
-        # loaded the user's own — plugin servers, ~/.claude.json, project
-        # .mcp.json. Measured: 5 servers and 36 mcp__ tools per agent, some
-        # with side effects outside the repo. dontAsk denied them, but they
-        # sat in every agent's context. setting_sources, plugins and skills
-        # come from ext_fields too.
+        # Settings, skills, plugins and MCP servers: none unless `ext` grants them.
         **ext_fields,
         hooks={
             "PreToolUse": [

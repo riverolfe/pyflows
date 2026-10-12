@@ -38,6 +38,7 @@ def isolated_state(tmp_path):
         f"refusing to clear a cache outside the test scratch dir: {orch.CACHE.directory}"
     )
     orch.CACHE.clear()
+    orch.STATS.reset()
     log = tmp_path / "runs" / "run.jsonl"
     with patched(orch, "RUN_LOG", log), patched(panel, "RUN_LOG", log):
         yield
