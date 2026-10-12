@@ -262,8 +262,13 @@ These are the rules the tests exist to protect. Each one is a bug that shipped.
   source under the review root: fingerprinted, one unit's code lands in
   another unit's cache key and a fan-out caches a result computed against
   the wrong tree — green, and stale.
-- **Agents are confined.** `cwd` plus `disallowed_tools`. Not a jail — `Read`
-  still takes absolute paths. For a real boundary use `can_use_tool`.
+- **Agents cannot read outside `cwd`.** A `PreToolUse` hook denies `Read`,
+  `Grep` and `Glob` on any path that resolves outside it — absolute, `..`, `~`,
+  a symlink in the repo, or a Glob pattern that climbs out after a wildcard
+  (`src/*/../../x`). `cwd` alone was not a boundary: a bare `"Read"` in
+  `allowed_tools` approves the whole tool. (Measured: before the hook, one
+  agent read, grepped and globbed a canary file outside `cwd`; after it, all
+  three were denied, and reads inside `cwd` still worked.)
 - **One terminal record per agent, carrying that agent's usage.** Not the
   run's running totals — the panel sums the records, so totals made N equal
   calls read as N(N+1)/2 calls' worth. And exactly one: a schema retry or a
@@ -345,13 +350,14 @@ run `pytest`, which uses fakes.
 
 ## Known limits
 
-- `cwd` is not a sandbox. An agent can still `Read` an absolute path outside it.
-- `can_use_tool` is **not** a fix for that here. An `allowed_tools` entry with
-  no specifier — `"Read"`, which is what pyflows sends — auto-approves the whole
-  tool *before* the callback is consulted, so the callback never fires and a
-  deny-everything gate still leaks. Measured: `allowed_tools=["Read"]` returned
-  the contents of a `.env` outside `cwd`. Real boundary means narrowing the
-  entries (`"Read(src/**)"`) or a PreToolUse hook.
+- The confinement hook is a read boundary, not a sandbox. Everything *inside*
+  `cwd` is readable, `.env` files included, and an agent that also holds
+  `WebFetch` (every `upgrade` agent) can still send what it read to a URL.
+  Point `upgrade` only at repos you trust.
+- `can_use_tool` would not have worked as the boundary. An `allowed_tools`
+  entry with no specifier — `"Read"`, which is what pyflows sends —
+  auto-approves the whole tool *before* the callback is consulted, so the
+  callback never fires. The hook runs before that approval.
 - `SandboxSettings` sandboxes **bash**, and pyflows disallows `Bash` — so it
   protects nothing here.
 - Batching trades independence for cost — a verifier that misreads finding 1
