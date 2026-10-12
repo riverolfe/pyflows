@@ -7,11 +7,13 @@ workflow needs them somewhere else.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import os
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +102,10 @@ def read_runs() -> list[list[dict]]:
 
 class BudgetExhausted(RuntimeError):
     pass
+
+
+class ExtensionError(ValueError):
+    """A granted skill, plugin or MCP config that does not exist or will not load."""
 
 
 class Stats:
@@ -316,10 +322,14 @@ def cache_key(
     system: str = "",
     cwd: str = ".",
     depends_on: str = "",
+    extensions: str = "",
 ) -> str:
     # Explicit fields, not a merged tuple — a system prompt concatenated onto
     # tools can collide with a different tools tuple.
-    blob = json.dumps([prompt, schema, sorted(tools), system, cwd, depends_on], sort_keys=True)
+    fields = [prompt, schema, sorted(tools), system, cwd, depends_on]
+    if extensions:  # appended only when set, so keys cached before it stay valid
+        fields.append(extensions)
+    blob = json.dumps(fields, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
@@ -327,8 +337,12 @@ def cache_key(
 PATH_TOOLS = {"Read": ("file_path",), "Grep": ("path",), "Glob": ("path", "pattern")}
 
 
-def _escapes(root: Path, tool: str, tool_input: dict) -> str | None:
-    """The first path in `tool_input` that resolves outside `root`, else None."""
+def _escapes(root: Path, tool: str, tool_input: dict, also: tuple[Path, ...] = ()) -> str | None:
+    """The first path in `tool_input` outside `root` and every `also` dir, else None.
+
+    `also` holds the granted skill and plugin dirs: a skill's SKILL.md tells
+    the agent to read its own references, which live outside the repo.
+    """
     base = root
     for field in PATH_TOOLS.get(tool, ()):
         value = tool_input.get(field)
@@ -340,15 +354,15 @@ def _escapes(root: Path, tool: str, tool_input: dict) -> str | None:
         # an inside prefix and still climbs out — wildcard segments resolve as
         # plain names, so the ".." after them is counted.
         target = (base / Path(value).expanduser()).resolve()
-        if not target.is_relative_to(root):
+        if not any(target.is_relative_to(r) for r in (root, *also)):
             return str(value)
         if field == "path":
             base = target  # Glob's pattern is relative to its path
     return None
 
 
-def _confine(root: Path):
-    """PreToolUse hook: deny Read/Grep/Glob on any path outside `root`.
+def _confine(root: Path, also: tuple[Path, ...] = ()):
+    """PreToolUse hook: deny Read/Grep/Glob on any path outside `root` (and `also`).
 
     The boundary cwd alone is not. A bare "Read" in allowed_tools approves the
     whole tool before can_use_tool is consulted, so absolute paths walked
@@ -358,7 +372,7 @@ def _confine(root: Path):
 
     async def hook(input_data: Any, _tool_use_id: str | None, _context: Any) -> dict:
         tool = input_data.get("tool_name", "")
-        escaped = _escapes(root, tool, input_data.get("tool_input") or {})
+        escaped = _escapes(root, tool, input_data.get("tool_input") or {}, also)
         if escaped is None:
             return {}
         return {
@@ -375,6 +389,167 @@ def _confine(root: Path):
     return hook
 
 
+USER_SKILLS = Path("~/.claude/skills").expanduser()
+# The plugin name user skills are served under. See _user_skill_plugin().
+SHIM_PLUGIN = "pyflows-user"
+
+
+@dataclass(frozen=True)
+class Extensions:
+    """What an agent may load beyond its `tools`. Empty unless a workflow says so.
+
+    Without this, every agent loaded the settings of the user AND of the repo
+    under review: measured live in a repo whose .claude/settings.local.json
+    allowed WebSearch, a Read/Grep/Glob agent ran a web search, saw ~110
+    skills and could invoke plugin skills. A reviewed repo widening its own
+    reviewers' permissions — or adding hooks, which are shell commands — is
+    the failure this closes. So agents load no settings at all, and each
+    workflow names what it needs:
+
+    `skills`  — skill names. "plugin:skill" needs that plugin in `plugins`;
+                a bare name is a user skill from ~/.claude/skills.
+    `plugins` — local plugin dirs; their skills become loadable by name.
+    `mcp`     — MCP server configs by name, each with its `mcp__<name>` tools
+                allowed. A plugin's own servers are NOT loaded: pass them here.
+    `inherit` — load user, project and local settings as Claude Code itself
+                would: every skill, plugin, MCP server and permission they grant.
+                Only for a repo you trust; its settings decide what agents may do.
+    """
+
+    skills: tuple[str, ...] = ()
+    plugins: tuple[str, ...] = ()
+    mcp: dict[str, dict] = dataclasses.field(default_factory=dict)
+    inherit: bool = False
+
+    def key(self) -> str:
+        """Cache-key part: empty for the default, so isolated keys do not move."""
+        if self == Extensions():
+            return ""
+        return json.dumps(
+            [sorted(self.skills), sorted(self.plugins), self.mcp, self.inherit], sort_keys=True
+        )
+
+
+NO_EXTENSIONS = Extensions()
+
+
+def _user_skill_plugin(names: tuple[str, ...]) -> Path:
+    """A local plugin dir serving user skills `names`, as `pyflows-user:<name>`.
+
+    With no setting sources the CLI never scans ~/.claude/skills — measured: a
+    bare skills=["qmd"] answered "Unknown skill: qmd". Loading "user" settings
+    to get it back would bring the user's permissions and hooks too. A plugin
+    is the one skill source that needs no settings, so the skills are linked
+    into one.
+    """
+    missing = [n for n in names if not (USER_SKILLS / n / "SKILL.md").is_file()]
+    if missing:
+        raise ExtensionError(f"no such user skill in {USER_SKILLS}: {', '.join(missing)}")
+    digest = hashlib.sha256("|".join(sorted(names)).encode()).hexdigest()[:12]
+    shim = Path(CACHE.directory) / "skill-shims" / digest
+    (shim / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+    (shim / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": SHIM_PLUGIN, "version": "0.0.0"})
+    )
+    (shim / "skills").mkdir(exist_ok=True)
+    for name in names:
+        link = shim / "skills" / name
+        if not link.is_symlink():
+            link.symlink_to(USER_SKILLS / name)
+    return shim
+
+
+def _extension_options(ext: Extensions) -> tuple[dict, list[str], tuple[Path, ...]]:
+    """(ClaudeAgentOptions fields, extra allowed tools, extra read roots) for `ext`.
+
+    Raises ExtensionError on a plugin or skill that does not exist: a typo must
+    fail the run, not quietly run an agent without the skill it was given.
+    """
+    plugins = []
+    for p in ext.plugins:
+        path = Path(p).expanduser().resolve()
+        if not path.is_dir():
+            raise ExtensionError(f"no such plugin dir: {p}")
+        plugins.append(path)
+    allowed = [f"mcp__{name}" for name in ext.mcp]
+
+    if ext.inherit:
+        skills: list[str] | str = list(ext.skills) or "all"
+        reads = (*plugins, USER_SKILLS.resolve())
+        fields: dict[str, Any] = {
+            # Explicit list: with skills set the SDK defaults to user+project,
+            # silently dropping settings.local.json.
+            "setting_sources": ["user", "project", "local"],
+            "mcp_servers": dict(ext.mcp),
+            "strict_mcp_config": False,
+        }
+    else:
+        user = tuple(n for n in ext.skills if ":" not in n)
+        skills = [n for n in ext.skills if ":" in n]
+        if user:
+            plugins.append(_user_skill_plugin(user))
+            skills += [f"{SHIM_PLUGIN}:{n}" for n in user]
+        reads = (*plugins, *((USER_SKILLS / n).resolve() for n in user))
+        fields = {"setting_sources": [], "mcp_servers": dict(ext.mcp), "strict_mcp_config": True}
+
+    fields["plugins"] = [{"type": "local", "path": str(p)} for p in plugins]
+    if skills:
+        fields["skills"] = skills
+    return fields, allowed, reads
+
+
+def add_extension_args(parser: Any) -> None:
+    """--skill / --plugin / --mcp-config / --inherit-settings on a workflow's CLI."""
+    g = parser.add_argument_group("extensions (agents load none unless named)")
+    g.add_argument(
+        "--skill",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="grant a skill: a user skill, or plugin:skill with --plugin (repeatable)",
+    )
+    g.add_argument(
+        "--plugin", action="append", default=[], metavar="DIR", help="load a local plugin dir"
+    )
+    g.add_argument(
+        "--mcp-config",
+        metavar="FILE",
+        default=None,
+        help='JSON file of {"mcpServers": {name: config}} to load',
+    )
+    g.add_argument(
+        "--inherit-settings",
+        action="store_true",
+        help="load user/project/local settings as Claude Code would — trusted repos only",
+    )
+
+
+def extensions_from(args: Any) -> Extensions:
+    mcp = {}
+    if args.mcp_config:
+        try:
+            mcp = json.loads(Path(args.mcp_config).expanduser().read_text())["mcpServers"]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ExtensionError(f"--mcp-config {args.mcp_config}: {exc!r}") from exc
+    return Extensions(
+        skills=tuple(args.skill),
+        plugins=tuple(args.plugin),
+        mcp=mcp,
+        inherit=args.inherit_settings,
+    )
+
+
+def extension_argv(args: Any) -> list[str]:
+    """The extension flags in `args`, back as argv — for a CLI that forwards."""
+    out = [a for s in args.skill for a in ("--skill", s)]
+    out += [a for p in args.plugin for a in ("--plugin", p)]
+    if args.mcp_config:
+        out += ["--mcp-config", args.mcp_config]
+    if args.inherit_settings:
+        out.append("--inherit-settings")
+    return out
+
+
 async def ask(
     prompt: str,
     schema: dict,
@@ -387,6 +562,7 @@ async def ask(
     label: str = "",
     depends_on: str | Path | None = None,
     max_budget_usd: float | None = None,
+    ext: Extensions = NO_EXTENSIONS,
 ) -> Any | None:
     """One agent call. Returns output that validates against `schema`, else None.
 
@@ -413,8 +589,11 @@ async def ask(
     and Glob on any path that resolves outside `cwd` — absolute, `..`, `~` or
     a symlink. Web tools are not confined: an agent given WebFetch can still
     send what it read under `cwd` to a URL. No MCP servers are loaded, the
-    user's own included (`strict_mcp_config`).
+    user's own included (`strict_mcp_config`), and no settings: no skills,
+    plugins or permissions from the user or from the repo under `cwd`. `ext`
+    grants them back, explicitly — see Extensions.
     """
+    ext_fields, ext_tools, ext_reads = _extension_options(ext)
     key = cache_key(
         prompt,
         schema,
@@ -422,6 +601,7 @@ async def ask(
         system or "",
         str(cwd),
         stat_signature(depends_on) if depends_on else "",
+        ext.key(),
     )
     if use_cache and (hit := CACHE.get(key)) is not None:
         STATS.cache_hits += 1
@@ -438,20 +618,23 @@ async def ask(
     root = str(Path(cwd).resolve())
     options = ClaudeAgentOptions(
         output_format={"type": "json_schema", "schema": schema},
-        allowed_tools=list(tools),
+        allowed_tools=[*tools, *ext_tools],
         disallowed_tools=["Bash", "Write", "Edit"],
         system_prompt=system,
         cwd=root,
         permission_mode="dontAsk",
         max_budget_usd=max_budget_usd,
-        # No MCP servers: without this every agent loaded the user's own —
-        # plugin servers, ~/.claude.json, project .mcp.json. Measured: 5 servers
-        # and 36 mcp__ tools per agent, some with side effects outside the repo.
-        # dontAsk denies them, but they sat in every agent's context.
-        mcp_servers={},
-        strict_mcp_config=True,
+        # No MCP servers unless `ext` names them: without this every agent
+        # loaded the user's own — plugin servers, ~/.claude.json, project
+        # .mcp.json. Measured: 5 servers and 36 mcp__ tools per agent, some
+        # with side effects outside the repo. dontAsk denied them, but they
+        # sat in every agent's context. setting_sources, plugins and skills
+        # come from ext_fields too.
+        **ext_fields,
         hooks={
-            "PreToolUse": [HookMatcher(matcher="|".join(PATH_TOOLS), hooks=[_confine(Path(root))])]
+            "PreToolUse": [
+                HookMatcher(matcher="|".join(PATH_TOOLS), hooks=[_confine(Path(root), ext_reads)])
+            ]
         },
     )
     try:
@@ -565,6 +748,8 @@ async def gather(coros: list[Any]) -> list[Any]:
     """
     results = await asyncio.gather(*coros, return_exceptions=True)
     for r in results:
-        if isinstance(r, BudgetExhausted):
+        # A bad extension is a config error, identical in every slot: as None
+        # it would report "all lenses failed" for a typo in --skill.
+        if isinstance(r, (BudgetExhausted, ExtensionError)):
             raise r
     return [None if isinstance(r, BaseException) else r for r in results]

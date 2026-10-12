@@ -38,7 +38,20 @@ import time
 import zlib
 from typing import Any
 
-from ..orch import MAX_CALLS, STATS, BudgetExhausted, _log_run, _Spend, ask, gather
+from ..orch import (
+    MAX_CALLS,
+    NO_EXTENSIONS,
+    STATS,
+    BudgetExhausted,
+    ExtensionError,
+    Extensions,
+    _log_run,
+    _Spend,
+    add_extension_args,
+    ask,
+    extensions_from,
+    gather,
+)
 
 # No tools. This is a judgement workflow, not a code one: the advocates argue
 # from the question, they do not go read the repo. Grounding a decision in
@@ -84,7 +97,12 @@ def _order(a: dict, b: dict) -> list[dict]:
     return sorted([a, b], key=lambda o: zlib.crc32(o["option"].encode()))
 
 
-async def decide(question: str, options: list[str], spend: _Spend | None = None) -> dict:
+async def decide(
+    question: str,
+    options: list[str],
+    spend: _Spend | None = None,
+    ext: Extensions = NO_EXTENSIONS,
+) -> dict:
     """Run a knockout bracket over `options`. Returns a brief.
 
     `spend` is injectable so a caller can share one call budget across a
@@ -104,6 +122,7 @@ async def decide(question: str, options: list[str], spend: _Spend | None = None)
                 f"soften your argument.",
                 CASE,
                 spend=spend,
+                ext=ext,
                 label=f"case/{opt}"[:32],
                 system="You advocate one option, alone. Be its best advocate.",
             )
@@ -153,6 +172,7 @@ async def decide(question: str, options: list[str], spend: _Spend | None = None)
                         "Return the index of the better plan.",
                         PAIR,
                         spend=spend,
+                        ext=ext,
                         # Only the panel truncates; truncating here would let two
                         # options sharing a prefix collapse into one label, and
                         # panel pairs by label.
@@ -245,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="cap the field size (default: as many as the call budget allows)",
     )
+    add_extension_args(parser)
     args = parser.parse_args(argv)
 
     options = list(dict.fromkeys(args.options))
@@ -285,8 +306,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{len(field)} option{'s' if len(field) != 1 else ''}{capped}")
 
     try:
-        brief = asyncio.run(decide(args.question, field, spend))
-    except (DecideFailed, BudgetExhausted) as exc:
+        brief = asyncio.run(decide(args.question, field, spend, extensions_from(args)))
+    except (DecideFailed, BudgetExhausted, ExtensionError) as exc:
         print(f"decision did not complete: {exc}\n{STATS.summary()}")
         return 1
 

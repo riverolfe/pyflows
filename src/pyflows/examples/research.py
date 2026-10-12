@@ -18,11 +18,16 @@ import time
 
 from ..orch import (
     MAX_CALLS,
+    NO_EXTENSIONS,
     STATS,
     BudgetExhausted,
+    ExtensionError,
+    Extensions,
     _log_run,
     _Spend,
+    add_extension_args,
     ask,
+    extensions_from,
     gather,
 )
 
@@ -145,6 +150,7 @@ async def research(
     angles: tuple[str, ...] = ANGLES,
     depth: int = 3,
     verify: bool = True,
+    ext: Extensions = NO_EXTENSIONS,
 ) -> dict:
     """Research a question. Returns the brief plus a verification summary."""
     spend = _Spend(MAX_CALLS)
@@ -164,6 +170,7 @@ async def research(
                 FINDINGS,
                 tools=WEB,
                 spend=spend,
+                ext=ext,
                 # Index into the short names so `watch` stays readable.
                 label=f"sweep/{ANGLE_NAMES[i % len(ANGLE_NAMES)]}",
                 system=f"You research via {angle}. Every claim needs a source URL.",
@@ -204,6 +211,7 @@ async def research(
         BRIEF,
         tools=WEB,
         spend=spend,
+        ext=ext,
         label="synthesize",
         system="You synthesize. Report disagreement rather than resolving it.",
     )
@@ -238,6 +246,7 @@ async def research(
                 VERDICT,
                 tools=WEB,
                 spend=spend,
+                ext=ext,
                 # Host + tail of the path, sized to fit the panel.STAGE_COL
                 # column alongside the "verify/" prefix.
                 label=f"verify/{url.split('//')[-1][:25]}",
@@ -301,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("--angles", type=int, default=None, help="limit search angles")
     rs.add_argument("--depth", type=int, default=3, help="citations to verify")
     rs.add_argument("--no-verify", action="store_true", help="skip citation checking")
+    add_extension_args(rs)
 
     args = parser.parse_args(argv)
     angles = ANGLES[: args.angles] if args.angles else ANGLES
@@ -311,8 +321,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"research: {len(angles)} angles")
     try:
-        brief = asyncio.run(research(args.question, angles, args.depth, not args.no_verify))
-    except (ResearchFailed, BudgetExhausted) as exc:
+        brief = asyncio.run(
+            research(args.question, angles, args.depth, not args.no_verify, extensions_from(args))
+        )
+    except (ResearchFailed, BudgetExhausted, ExtensionError) as exc:
         print(f"research did not complete: {exc}\n{STATS.summary()}")
         return 1
 
