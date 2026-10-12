@@ -217,7 +217,9 @@ These are the rules the tests exist to protect. Each one is a bug that shipped.
   (Observed: a run that spent 0.41M tokens and 917s reporting "0 breaks" while
   every WebFetch silently failed.)
 - **A dead run never exits clean.** Every lens dead, or every verifier dead,
-  raises. Otherwise "reviewed nothing" reads as "found nothing".
+  raises. Otherwise "reviewed nothing" reads as "found nothing". The converse
+  holds too: live lenses that found nothing is a clean review, and exits 0 —
+  zero findings means zero verifier batches, not that every batch died.
 - **A dead stage is `None`, a blown budget is an exception.** Exhausting
   `MAX_CALLS` must stop the run, not truncate it into a short result.
 - **A budget stop is not a dead stage.** The CLI enforces `max_budget_usd`

@@ -91,8 +91,11 @@ async def review(
     target: str,
     lenses: tuple[str, ...] = LENSES,
     batch_size: int | None = None,
-) -> list[dict]:
-    """Return findings that survived verification.
+) -> dict:
+    """Return {"confirmed": findings that survived, "unconfirmed": count never judged}.
+
+    Unconfirmed is returned, not just printed: a run whose verifier died is a
+    partial review, and `main` must not exit 0 over findings nobody checked.
 
     `batch_size` None means one verifier per batch of BATCH_SIZE findings;
     pass a value >= the finding count to force a single verifier.
@@ -129,6 +132,12 @@ async def review(
             if _key(f) not in seen:
                 seen.add(_key(f))
                 unique.append(f)
+
+    # Live lenses that found nothing is a clean review, not a dead one: with
+    # no batches, `any([])` below would report "all 0 verification batches failed".
+    if not unique:
+        print(f"no findings from {len(alive)}/{len(lenses)} lenses")
+        return {"confirmed": [], "unconfirmed": 0}
 
     print(f"{len(unique)} unique findings from {len(alive)}/{len(lenses)} lenses, verifying…")
 
@@ -181,7 +190,7 @@ async def review(
     if not any(results):
         raise ReviewFailed(f"all {len(batches)} verification batches failed")
 
-    return confirmed
+    return {"confirmed": confirmed, "unconfirmed": unconfirmed}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -269,22 +278,21 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{mode}: {len(lenses)} lens{'es' if len(lenses) != 1 else ''} on {target}")
 
     try:
-        confirmed = asyncio.run(review(str(target), lenses, batch_size))
+        result = asyncio.run(review(str(target), lenses, batch_size))
     except (ReviewFailed, BudgetExhausted) as exc:
         print(f"review did not complete: {exc}\n{STATS.summary()}")
         return 1
 
-    if not confirmed:
-        print("nothing survived verification")
-        print(STATS.summary())
-        return 0
-
+    confirmed, unconfirmed = result["confirmed"], result["unconfirmed"]
     for f in confirmed:
         print(f"\n{f['file']}:{f['line']}  {f['summary']}\n  {f['reason']}")
-    print(f"\n{len(confirmed)} confirmed")
+    print(f"\n{len(confirmed)} confirmed" if confirmed else "nothing survived verification")
+    if unconfirmed:
+        print(f"{unconfirmed} findings NOT verified — this review is partial, not clean")
     print(STATS.summary())
     print(f"wall clock: {time.monotonic() - started:.0f}s")
-    return 0
+    # Same rule as a dead lens: findings nobody judged are not findings refuted.
+    return 1 if unconfirmed else 0
 
 
 if __name__ == "__main__":
