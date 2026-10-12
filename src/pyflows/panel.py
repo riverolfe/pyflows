@@ -51,13 +51,15 @@ def _stage_rows(run: list[dict]) -> list[tuple[str, str, str, str, str]]:
         elif queue:
             row = rows[queue.pop(0)]  # oldest unclaimed start for this label
             row[1] = OUTCOMES.get(outcome, ("?", ""))[0]
-            if outcome == "ok":
+            # Any terminal record with usage, not just "ok": a FAIL or BUDGET
+            # row that made calls still spent tokens.
+            if "input" in record:
                 row[2] = f"{(record.get('input') or 0) / 1000:.1f}k"
                 row[3] = f"{(record.get('output') or 0) / 1000:.1f}k"
                 row[4] = f"{record.get('seconds', 0):.1f}"
         else:  # a terminal record with no start (older logs, or a wiped log)
             row = [label, OUTCOMES.get(outcome, ("?", ""))[0], "-", "-", "-"]
-            if outcome == "ok":
+            if "input" in record:
                 row[2] = f"{(record.get('input') or 0) / 1000:.1f}k"
                 row[3] = f"{(record.get('output') or 0) / 1000:.1f}k"
                 row[4] = f"{record.get('seconds', 0):.1f}"

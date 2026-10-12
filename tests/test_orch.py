@@ -7,6 +7,7 @@ import os
 import pytest
 
 import pyflows.orch as orch
+import pyflows.panel as panel
 from conftest import message, patched
 from pyflows.orch import (
     BudgetExhausted,
@@ -279,13 +280,92 @@ def test_stats_reads_flat_usage_and_tolerates_null_duration():
                 "cache_creation_input_tokens": 7,
             },
         ),
-        "t",
     )
     assert orch.STATS.input_tokens == 100, orch.STATS.summary()
     assert orch.STATS.output_tokens == 20
     assert (orch.STATS.cache_read, orch.STATS.cache_write) == (5, 7)
     assert orch.STATS.cost_usd == 0.5
     assert orch.STATS.seconds == 0.0
+
+
+def _log():
+    return [json.loads(line) for line in orch.RUN_LOG.read_text().splitlines()]
+
+
+def test_each_log_record_carries_its_own_calls_usage():
+    # The bug: records logged the run's running totals, and the panel sums the
+    # records — two equal 10k calls showed as 10k + 20k = 30k of input.
+    usage = {"input_tokens": 10_000, "output_tokens": 500, "cache_read_input_tokens": 3}
+
+    async def run(prompt, options):
+        return message(structured_output={"a": 1}, usage=usage)
+
+    orch.STATS.reset()
+    with patched(orch, "_run", run):
+        for label in ("find/a", "find/b"):
+            asyncio.run(orch.ask("p", {"type": "object"}, use_cache=False, label=label))
+
+    done = [r for r in _log() if r["outcome"] == "ok"]
+    assert [(r["input"], r["output"], r["cache_read"]) for r in done] == [(10_000, 500, 3)] * 2
+    assert orch.STATS.input_tokens == 20_000, "STATS keeps the run total"
+
+
+def test_every_agent_logs_exactly_one_terminal_record():
+    # The bug: a retry or a budget stop logged an "ok" first, which claimed the
+    # panel row as done; the real outcome landed as an orphan row, so an agent
+    # that never produced valid output displayed as finished.
+    schema = {"type": "object", "required": ["a"]}
+    usage = {"input_tokens": 100, "output_tokens": 10}
+    replies = {
+        "fixed-on-retry": [{"wrong": 1}, {"a": 1}],
+        "never-valid": [{"wrong": 1}, {"wrong": 2}],
+    }
+
+    for label, outcome in [("fixed-on-retry", "done"), ("never-valid", "FAIL")]:
+        orch.RUN_LOG.unlink(missing_ok=True)
+        queue = list(replies[label])
+
+        async def run(prompt, options, queue=queue):
+            return message(structured_output=queue.pop(0), usage=usage)
+
+        with patched(orch, "_run", run):
+            asyncio.run(orch.ask("p", schema, use_cache=False, label=label))
+
+        records = _log()
+        assert [r["outcome"] for r in records][0] == "started", records
+        assert len(records) == 2, f"{label}: one start, one terminal record — got {records}"
+        assert records[1]["retry"] is True and records[1]["input"] == 200, records[1]
+        # A FAIL row still made two calls: it shows what they cost, not blanks.
+        assert [r[1:3] for r in panel._stage_rows(records)] == [(outcome, "0.2k")], records
+
+    orch.RUN_LOG.unlink(missing_ok=True)
+
+    async def broke(prompt, options):
+        return message(subtype="error_max_budget_usd", is_error=True, usage=usage)
+
+    with patched(orch, "_run", broke), pytest.raises(orch.BudgetExhausted):
+        asyncio.run(orch.ask("p", schema, use_cache=False, label="b", max_budget_usd=0.01))
+    assert [r[1] for r in panel._stage_rows(_log())] == ["BUDGET"], _log()
+
+
+def test_summary_counts_cache_tokens_and_cost():
+    # The bug: "tokens: 0.01M total" for a run that processed 0.73M — cache
+    # reads and writes were left out of the total, and no cost was printed.
+    orch.STATS.reset()
+    orch.STATS.record(
+        message(
+            total_cost_usd=2.5,
+            usage={
+                "input_tokens": 34,
+                "output_tokens": 14_500,
+                "cache_read_input_tokens": 440_000,
+                "cache_creation_input_tokens": 270_000,
+            },
+        )
+    )
+    text = orch.STATS.summary()
+    assert "0.72M processed" in text, text
+    assert "$2.50" in text, text
 
 
 def test_default_paths_are_absolute_and_keep_the_log_out_of_the_cache(tmp_path, monkeypatch):
