@@ -74,6 +74,31 @@ def test_cache_key_separates_every_input_it_is_built_from():
     assert cache_key("p", {"t": 1}, ("Read",)) == cache_key("p", {"t": 1}, ("Read",))
 
 
+def test_stat_signature_catches_an_edit_the_clock_did_not_see(tmp_path):
+    # The bug: ext4 stamps mtime from a clock that ticks every few ms, so two
+    # same-size writes in one tick got the same mtime_ns and the same key — a
+    # review served the result for the code before the edit. Pin the mtime by
+    # hand so this fails on every filesystem, not just a coarse one.
+    src = tmp_path / "a.py"
+    src.write_text("x = 1\n")
+    stamp = src.stat().st_mtime_ns
+    before = stat_signature(tmp_path)
+
+    src.write_text("x = 2\n")
+    os.utime(src, ns=(stamp, stamp))
+    assert stat_signature(tmp_path) != before
+
+    # Outside the window the stat is trusted and the file is not read — the
+    # cheap path the fingerprint exists for. Hashing everything would pass the
+    # assertion above and fail this one.
+    old = stamp - 10 * orch.RACY_WINDOW_NS
+    os.utime(src, ns=(old, old))
+    before = stat_signature(tmp_path)
+    src.write_text("x = 3\n")
+    os.utime(src, ns=(old, old))
+    assert stat_signature(tmp_path) == before
+
+
 def test_stat_signature_tracks_source_edits_not_other_files(tmp_path):
     src = tmp_path / "a.py"
     src.write_text("x = 1\n")

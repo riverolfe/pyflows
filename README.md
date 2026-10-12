@@ -231,7 +231,11 @@ These are the rules the tests exist to protect. Each one is a bug that shipped.
   on a mismatch before giving up.
 - **The cache key covers everything the answer depends on** — including a
   fingerprint of the source tree, since the prompt never quotes the files.
-  mtime in nanoseconds: two edits in the same second must not collide.
+  mtime in nanoseconds: two edits in the same second must not collide. But
+  nanosecond mtime is not nanosecond precision — ext4 stamps from a clock that
+  ticks every few ms, so two same-size writes in one tick look identical. A
+  file modified within the last 2s (`RACY_WINDOW_NS`) has its content hashed
+  too, git's "racy git" rule; older files stay a cheap stat.
   The fingerprint covers the ~25 languages in `DEFAULT_EXTS` — plus `.yml`/`.yaml`,
   since a pipeline is code with the same review needs — and skips
   `node_modules`, `dist`, `target` and friends. Defaulting to `.py` alone
