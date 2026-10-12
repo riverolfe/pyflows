@@ -256,6 +256,9 @@ async def upgrade(
         "findings": findings,
         "confirmed": [],
         "refuted": [],
+        # Never verified: no verdict came back, or the claim was never sent.
+        # Not refuted — "safe to bump" over these is a guess, not a finding.
+        "unconfirmed": [],
     }
 
     # Nothing was actually checked. Say so rather than reporting the deps safe.
@@ -267,10 +270,13 @@ async def upgrade(
         )
 
     if not verify or not findings:
+        result["unconfirmed"] = [{"finding": f, "why": "verification skipped"} for f in findings]
         result["elapsed"] = time.monotonic() - started
         return result
 
-    targets = sorted(findings, key=lambda f: (f["dependency"], f["file"]))[:depth]
+    ranked = sorted(findings, key=lambda f: (f["dependency"], f["file"]))
+    targets = ranked[:depth]
+    result["unconfirmed"] = [{"finding": f, "why": "beyond --depth"} for f in ranked[depth:]]
     print(f"checking {len(targets)} of {len(findings)} candidate breaks…")
 
     # One verifier per batch, like review: reading the repo again per finding
@@ -304,7 +310,7 @@ async def upgrade(
 
     for batch, verdict in zip(_batches(targets, 5), verdicts, strict=True):
         if verdict is None:
-            result["refuted"].extend(
+            result["unconfirmed"].extend(
                 {"finding": f, "why": "verifier did not answer"} for f in batch
             )
             continue
@@ -315,7 +321,7 @@ async def upgrade(
         for i, f in enumerate(batch):
             v = by_index.get(i)
             if v is None:
-                result["refuted"].append({"finding": f, "why": "verifier skipped this claim"})
+                result["unconfirmed"].append({"finding": f, "why": "verifier skipped this claim"})
             else:
                 entry = {"finding": f, "why": v.get("reason", "")}
                 (result["confirmed"] if v.get("breaks_here") else result["refuted"]).append(entry)
@@ -354,7 +360,17 @@ def render(brief: dict) -> None:
             f"\n{unchecked}/{brief['audited'] + unchecked} dependencies were NOT checked — "
             f"their agents reached no changelog. Absence of findings there is unchecked, not safe."
         )
-    if not brief["confirmed"] and not unchecked:
+    # A candidate nobody verified is neither a break nor a refutation.
+    unconfirmed = brief.get("unconfirmed") or []
+    if unconfirmed:
+        print(
+            f"\n{len(unconfirmed)}/{len(brief['findings'])} candidate breaks were NOT verified "
+            f"(dead or skipped verifier, beyond --depth, or --no-verify):"
+        )
+        for entry in unconfirmed:
+            f = entry["finding"]
+            print(f"  {f['dependency']}  {f['file']}:{f['line']}  {f['summary']}  [{entry['why']}]")
+    if not brief["confirmed"] and not unchecked and not unconfirmed:
         print("no confirmed breaks — the deps look safe to bump")
 
 
@@ -396,8 +412,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n{STATS.summary()}")
     print(f"wall clock: {time.monotonic() - started:.0f}s")
     # A partial audit is not a clean one — same rule the other two examples
-    # follow, and the reason `main` must not exit 0 over unchecked deps.
-    return 1 if brief.get("unchecked") else 0
+    # follow, and the reason `main` must not exit 0 over unchecked deps or
+    # candidate breaks nobody verified.
+    return 1 if brief.get("unchecked") or brief.get("unconfirmed") else 0
 
 
 if __name__ == "__main__":

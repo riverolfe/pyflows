@@ -341,6 +341,9 @@ run `pytest`, which uses fakes.
   one refutation attempt rather than four opinions disagreeing.
 - Research verification checks the first `--depth` sources, which is an
   arbitrary prefix, not the most load-bearing ones. Pick by hand for now.
+  `upgrade --depth` is the same prefix, ordered by dependency then file — but
+  the rest are reported as unverified, so a shallow depth costs an exit code,
+  not a false "safe".
 - `decide` advocates run with no tools. They argue from the question, they do
   not go read the repo, so "which library should we use?" is decided on what the
   question says rather than on what this codebase actually does. Put the
