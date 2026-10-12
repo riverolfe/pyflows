@@ -16,10 +16,8 @@ Two rules do the real work:
 - **Advocates are blind to each other.** An agent that saw the other options
   would converge on the most defensible-sounding one, which is the same answer
   you already had. Same invariant research.py's sweep angles hold.
-- **The judges are blind to identity.** A judge sees "Candidate 1" and
-  "Candidate 2", never the option name, so it cannot pick on brand rather than
-  merit — and the two are presented in an order seeded by their contents, so a
-  judge with a first-position bias cannot win every match by default.
+- **Judges see plans, not option names.** Each side is shown as "Candidate
+  0/1" with its plan and caveat, in an order seeded by the options' text.
 
 Single elimination, not round robin: n advocates + (n-1) judges, so 4 options
 cost 7 agents. Round robin would cost 6 judges for the same 4.
@@ -53,10 +51,9 @@ from ..orch import (
     gather,
 )
 
-# No tools. This is a judgement workflow, not a code one: the advocates argue
-# from the question, they do not go read the repo. Grounding a decision in
-# actual code means passing the relevant facts in the question — see the
-# ponytail note in decide().
+# Advocates and judges run with no tools.
+TOOLS: tuple[str, ...] = ()
+
 CASE = {
     "type": "object",
     "properties": {
@@ -119,8 +116,10 @@ async def decide(
                 f"{question}\n\nMake the strongest honest case for option {i}: "
                 f"{opt}\n\nArgue FOR it. Do not hedge and do not compare — you "
                 f"cannot see the other options, and naming them would only "
-                f"soften your argument.",
+                f"soften your argument. Do not name the option itself in the "
+                f"plan or caveat; describe what it does.",
                 CASE,
+                tools=TOOLS,
                 spend=spend,
                 ext=ext,
                 label=f"case/{opt}"[:32],
@@ -163,7 +162,7 @@ async def decide(
                     ask(
                         f"{question}\n\nPick the stronger of these two plans.\n\n"
                         + "\n\n".join(
-                            f"[{i}] {c['option']}\n    Plan: {c['case']['plan']}\n"
+                            f"[{i}] Candidate {i}\n    Plan: {c['case']['plan']}\n"
                             f"    Weakest point: {c['case']['caveat']}"
                             for i, c in enumerate(pair)
                         )
@@ -171,11 +170,9 @@ async def decide(
                         'one — "both are fine" is not a verdict you can return. '
                         "Return the index of the better plan.",
                         PAIR,
+                        tools=TOOLS,
                         spend=spend,
                         ext=ext,
-                        # Only the panel truncates; truncating here would let two
-                        # options sharing a prefix collapse into one label, and
-                        # panel pairs by label.
                         label=f"judge/{pair[0]['option']}"[:32],
                         system="You are an impartial judge. One winner or nothing.",
                     )
@@ -279,9 +276,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"--max {args.max} leaves no tournament; it needs at least 2")
         return 1
 
-    # n advocates + (n-1) judges. Say so when the budget cannot hold the field,
-    # the way upgrade() does — a tournament that quietly enters 5 of 12 options
-    # reports a winner as though 12 played.
+    # n advocates + (n-1) judges must fit the call budget.
     capped = ""
     field = options
     spend = _Spend(MAX_CALLS)
@@ -289,9 +284,10 @@ def main(argv: list[str] | None = None) -> int:
         field = options[: args.max]
         if len(field) < len(options):
             capped = f" (capped from {len(options)})"
-    elif len(options) * 2 - 1 > spend.remaining:
-        field = options[: (spend.remaining + 1) // 2]
-        capped = f" — only {len(field)}/{len(options)} fit the budget"
+    if len(field) * 2 - 1 > spend.remaining:
+        fits = (spend.remaining + 1) // 2
+        capped = f" — only {fits}/{len(options)} fit the budget"
+        field = field[:fits]
 
     STATS.reset()
     started = time.monotonic()

@@ -73,6 +73,8 @@ def test_confinement_denies_every_route_out_of_cwd(tmp_path):
     root = (tmp_path / "repo").resolve()
     root.mkdir()
     (root / "leak").symlink_to(tmp_path)  # a link in the repo pointing out of it
+    (root / "deep" / "sub").mkdir(parents=True)
+    (root / "inner").symlink_to(root / "deep" / "sub")  # a link that stays inside
     outside = str(tmp_path / "secret.env")
 
     for tool, tool_input in [
@@ -86,6 +88,9 @@ def test_confinement_denies_every_route_out_of_cwd(tmp_path):
         ("Glob", {"pattern": "*.env", "path": ".."}),
         ("Glob", {"pattern": "../../*", "path": "src"}),
         ("Glob", {"pattern": "src/*/../../../*.env"}),  # inside prefix, climbs out
+        ("Grep", {"pattern": "KEY", "path": "inner/../leak"}),  # ".." after an inside link
+        ("Glob", {"pattern": "*", "path": "inner/../leak"}),
+        ("Read", {"file_path": "inner/../leak/secret.env"}),
     ]:
         assert _hook_decision(root, tool, tool_input) == "deny", (tool, tool_input)
 
@@ -449,6 +454,16 @@ def test_every_agent_logs_exactly_one_terminal_record():
         asyncio.run(orch.ask("p", schema, use_cache=False, label="b", max_budget_usd=0.01))
     assert [r[1] for r in panel._stage_rows(_log())] == ["BUDGET"], _log()
 
+    # Budget runs out at the schema retry: still one terminal record.
+    orch.RUN_LOG.unlink(missing_ok=True)
+
+    async def invalid(prompt, options):
+        return message(structured_output={"wrong": 1}, usage=usage)
+
+    with patched(orch, "_run", invalid), pytest.raises(orch.BudgetExhausted):
+        asyncio.run(orch.ask("p", schema, use_cache=False, label="r", spend=orch._Spend(1)))
+    assert [r[1:3] for r in panel._stage_rows(_log())] == [("BUDGET", "0.1k")], _log()
+
 
 def test_summary_counts_cache_tokens_and_cost():
     # The bug: "tokens: 0.01M total" for a run that processed 0.73M — cache
@@ -565,12 +580,15 @@ def test_a_granted_user_skill_loads_without_loading_user_settings(tmp_path):
 
 
 def test_a_missing_skill_or_plugin_stops_the_run_not_one_slot(tmp_path):
-    # A typo in --skill is the same in every agent: swallowed into None per
-    # slot, it would report "all lenses failed" instead of naming the typo.
     with patched(orch, "USER_SKILLS", tmp_path):
+        plugin = tmp_path / "plug"
+        (plugin / ".claude-plugin").mkdir(parents=True)
+        (plugin / ".claude-plugin" / "plugin.json").write_text('{"name": "plug"}')
         for ext in (
             orch.Extensions(skills=("nope",)),
             orch.Extensions(plugins=(str(tmp_path / "nope"),)),
+            orch.Extensions(skills=("plug:nope",), plugins=(str(plugin),)),
+            orch.Extensions(skills=("nope:skill",), plugins=(str(plugin),)),
         ):
             with pytest.raises(orch.ExtensionError, match="nope"):
                 asyncio.run(gather([orch.ask("p", {"type": "object"}, ext=ext)]))
@@ -578,7 +596,8 @@ def test_a_missing_skill_or_plugin_stops_the_run_not_one_slot(tmp_path):
 
 def test_granted_plugins_skills_and_mcp_are_passed_and_allowed(tmp_path):
     plugin = tmp_path / "fw-guru"
-    plugin.mkdir()
+    (plugin / "skills" / "crg").mkdir(parents=True)
+    (plugin / "skills" / "crg" / "SKILL.md").write_text("x")
     server = {"type": "stdio", "command": "crg", "args": ["serve"]}
     opts = _options_for(
         orch.Extensions(skills=("fw-guru:crg",), plugins=(str(plugin),), mcp={"crg": server})
@@ -644,3 +663,71 @@ def test_agents_sharing_a_label_get_distinct_ones():
 
     orch.STATS.reset()
     assert orch.STATS.unique("verify/x") == "verify/x"
+
+
+def test_extensions_reject_bad_shapes_and_cannot_be_changed():
+    for kw in (
+        {"skills": "qmd"},
+        {"plugins": [1]},
+        {"mcp": {"x": ["not", "a", "config"]}},
+        {"mcp": {"x": {"obj": object()}}},
+    ):
+        with pytest.raises(orch.ExtensionError):
+            orch.Extensions(**kw)
+
+    source = {"crg": {"command": "crg", "args": ["serve"]}}
+    ext = orch.Extensions(mcp=source)
+    source["crg"]["command"] = "changed"
+    assert ext.mcp_servers() == {"crg": {"command": "crg", "args": ["serve"]}}
+    with pytest.raises(TypeError):
+        orch.NO_EXTENSIONS.mcp["x"] = {}  # type: ignore[index]
+    with pytest.raises(TypeError):
+        ext.mcp["crg"]["command"] = "x"  # type: ignore[index]
+    assert hash(ext) == hash(orch.Extensions(mcp={"crg": {"command": "crg", "args": ["serve"]}}))
+    assert orch.NO_EXTENSIONS.key() == ""
+
+
+def test_a_stale_shim_link_is_replaced(tmp_path):
+    skills = tmp_path / "skills"
+    (skills / "qmd").mkdir(parents=True)
+    (skills / "qmd" / "SKILL.md").write_text("x")
+    with patched(orch, "USER_SKILLS", skills):
+        shim = orch._user_skill_plugin(("qmd",))
+        link = shim / "skills" / "qmd"
+        link.unlink()
+        link.symlink_to(tmp_path)  # planted elsewhere
+        assert orch._user_skill_plugin(("qmd",)) == shim
+    assert link.resolve() == (skills / "qmd").resolve()
+
+
+def test_cache_failures_warn_and_keep_the_result(capsys):
+    async def ok(prompt, options):
+        return message(structured_output={"a": 1})
+
+    class Broken:
+        directory = orch.CACHE.directory
+
+        def get(self, key):
+            raise orch.sqlite3.OperationalError("database is locked")
+
+        def set(self, key, value):
+            raise OSError("disk full")
+
+    with patched(orch, "_run", ok), patched(orch, "CACHE", Broken()):
+        assert asyncio.run(orch.ask("p", {"type": "object"}, label="x")) == {"a": 1}
+    text = capsys.readouterr().out
+    assert "cache read failed [x]" in text and "cache write failed [x]" in text, text
+
+
+def test_gather_prints_what_it_swallows(capsys):
+    async def boom():
+        raise KeyError("lost")
+
+    assert asyncio.run(gather([boom()])) == [None]
+    assert "stage raised: KeyError" in capsys.readouterr().out
+
+
+def test_stat_signature_skips_files_that_are_not_regular(tmp_path):
+    os.mkfifo(tmp_path / "trap.py")  # a fresh fifo: reading it would block
+    (tmp_path / "real.py").write_text("x")
+    assert stat_signature(tmp_path) == stat_signature(tmp_path)

@@ -225,6 +225,7 @@ async def research(
         # Citations whose verifier died: neither held up nor refuted.
         "unchecked": [],
         "angles_alive": len(alive),
+        "angles_dead": len(angles) - len(alive),
     }
 
     if not verify:
@@ -235,6 +236,11 @@ async def research(
     # and still rest on a source that does not say what it is claimed to say.
     targets = _citations(brief)[:depth]
     print(f"checking {len(targets)} source citations…")
+    if not targets:
+        result["verified"] = 0
+        result["nothing_checked"] = True
+        result["elapsed"] = time.monotonic() - started
+        return result
 
     verdicts = await gather(
         [
@@ -296,7 +302,12 @@ def render(brief: dict) -> None:
         print(f"\nCitations NOT checked ({len(unchecked)}) — their verifier did not answer:")
         for c in unchecked:
             print(f"  ? {c['url']}\n    {c['claim']}")
-    if brief.get("verified") is not None and not brief["unsupported"] and not unchecked:
+    dead = brief.get("angles_dead") or 0
+    if dead:
+        print(f"\n{dead} search angles failed — this brief is partial, not complete")
+    if brief.get("nothing_checked"):
+        print("\nNo citation could be checked — the brief cites no claim with a URL.")
+    elif brief.get("verified") is not None and not brief["unsupported"] and not unchecked:
         print(f"\nAll {brief['verified']} checked citations held up.")
 
 
@@ -330,8 +341,8 @@ def main(argv: list[str] | None = None) -> int:
     render(brief)
     print(f"\n{STATS.summary()}")
     print(f"wall clock: {brief['elapsed']:.0f}s")
-    # A citation nobody checked is not one that held up.
-    return 1 if brief.get("unchecked") else 0
+    partial = ("unchecked", "angles_dead", "nothing_checked")
+    return 1 if any(brief.get(k) for k in partial) else 0
 
 
 if __name__ == "__main__":

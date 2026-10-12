@@ -63,7 +63,8 @@ pyflows watch                   # live panel while a run is in flight
 ```
 
 Every command exits non-zero when the run did not complete — a dead run never
-reports "clean". So does a run that finished with work nobody checked: a review
+reports "clean". So does a run where some agents died (a lens, a search angle,
+a dependency agent), or one that finished with work nobody checked: a review
 finding no verifier judged, a citation whose checker died, a candidate break
 left unverified. A partial answer is reported as partial.
 
@@ -161,7 +162,7 @@ see the others, and options are eliminated head to head until one is left.
 
 | | |
 |---|---|
-| **Judges are blind to identity.** | A judge sees "Candidate 0" and "Candidate 1", never the option name, so it cannot pick on brand over merit. The two are presented in an order seeded by their own contents, so a first-position bias cannot win every match by default — and seeding it means the cache does not freeze whichever order ran first. |
+| **Judges see plans, not names.** | A judge sees "Candidate 0" and "Candidate 1" with their plans, and advocates are told not to name their option, so a judge weighs the plan rather than the brand. A plan can still give its option away. The two are presented in an order seeded by their own contents, so a first-position bias cannot win every match by default — and seeding it means the cache does not freeze whichever order ran first. |
 | **Single elimination, not round robin.** | 4 options cost 7 agents: 4 advocates + 3 judges. Round robin would spend 6 judges on the same field. |
 | **An undecided matchup advances both.** | A dead judge must not eliminate a contender — that is a result nobody voted for, and the champion would inherit a field that shrank for no stated reason. When a whole round decides nothing, the remaining options are a tie and there is no winner at all. Either way the command exits non-zero. |
 

@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 import pyflows.examples.research as research
+import pyflows.orch as orch
 from conftest import patched
 
 
@@ -212,3 +213,61 @@ def test_citation_check_labels_keep_the_end_of_the_source():
 
     assert len(set(labels)) == 2, labels
     assert labels[0].endswith("doc/parser.md") and labels[1].endswith("doc/vpid.md"), labels
+
+
+def test_a_dead_search_angle_is_not_a_clean_run(capsys):
+    calls = []
+
+    async def fake(prompt, schema, **kw):
+        if "Synthesize" in prompt:
+            return _brief_with_sources("http://a")
+        if "actually support" in prompt:
+            return {"supported": True, "reason": "ok"}
+        calls.append(prompt)
+        return None if len(calls) == 1 else {"findings": []}
+
+    with patched(research, "ask", fake):
+        code = research.main(["research", "q", "--angles", "2", "--depth", "1"])
+
+    assert code == 1
+    assert "1 search angles failed" in capsys.readouterr().out
+
+
+GRANT = orch.Extensions(skills=("s",), inherit=True)
+
+
+def _exts_seen(fake):
+    seen = []
+
+    async def spy(prompt, schema, **kw):
+        seen.append(kw.get("ext"))
+        return await fake(prompt, schema, **kw)
+
+    return spy, seen
+
+
+def test_every_research_agent_gets_the_granted_extensions():
+    async def fake(prompt, schema, **kw):
+        if "Synthesize" in prompt:
+            return _brief_with_sources("http://a")
+        if "actually support" in prompt:
+            return {"supported": True, "reason": "ok"}
+        return {"findings": []}
+
+    spy, seen = _exts_seen(fake)
+    with patched(research, "ask", spy):
+        asyncio.run(research.research("q", depth=1, ext=GRANT))
+    assert len(seen) == len(research.ANGLES) + 2 and all(e is GRANT for e in seen), seen
+
+
+def test_a_brief_with_no_checkable_citation_is_not_a_clean_run(capsys):
+    async def fake(prompt, schema, **kw):
+        if "Synthesize" in prompt:
+            return {**_brief_with_sources(), "sources": [{"claim": "x", "url": ""}]}
+        return {"findings": []}
+
+    with patched(research, "ask", fake):
+        code = research.main(["research", "q"])
+    text = capsys.readouterr().out
+    assert code == 1
+    assert "No citation could be checked" in text and "held up" not in text, text
