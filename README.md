@@ -72,8 +72,8 @@ independently; findings are deduplicated; one agent per batch tries to *refute*
 each survivor. Cheap: a cached re-run costs nothing.
 
 ```
-                    ┌ correctness ────┐
-                    ├ security ───────┤
+                    ┌ correctness ─────┐
+                    ├ security ────────┤
    src ────────────▶├ performance ─────┼──▶ ▓▓ barrier ▓▓ ──▶ dedupe ──▶ 5/agent ──▶ confirmed
                     ├ error-handling ──┤     all 4 lenses in
                     └──────────────────┘
@@ -116,17 +116,17 @@ manifest, then one agent per dependency asks what upgrading it would break
 
 ```
                     ┌ inventory ──────┐
-   target ─────────▶│ N deps, found  │──▶ the N below is not known before the run starts
+   target ─────────▶│ N deps, found   │──▶ the N below is not known before the run starts
                     └─────────────────┘
                               │
              ┌────────────────┼────────────────┐
              ▼                ▼                ▼
-        dep/django ──▶ dep/requests ──▶ dep/attrs ──▶ …        N agents, blind to
+         dep/django      dep/requests      dep/attrs  …     N agents, blind to
              │                │                │            each other, repo + web
              └────────────────┴────────────────┘
                               │
                               ▼
-                     ▓▓ barrier ▓▓ ──▶ dedupe ──▶ 5/agent ──▶ confirmed brief
+                        ▓▓ barrier ▓▓ ──▶ dedupe ──▶ 5/agent ──▶ confirmed brief
 ```
 
 Dependencies are ranked direct-first then by how many places use them, so a
@@ -348,7 +348,8 @@ that it fails. A test that survives the mutation is decoration:
 
 ```bash
 # narrow the panel column; test_research_labels_fit_the_panel_column should fail
-sed -i '' 's/STAGE_COL = 32/STAGE_COL = 20/' src/pyflows/panel.py && uv run pytest -q
+# (macOS/BSD sed needs `sed -i ''` instead of `sed -i`)
+sed -i 's/STAGE_COL = 32/STAGE_COL = 20/' src/pyflows/panel.py && uv run pytest -q
 ```
 
 That check earned its keep here — a `len(label) <= 32` literal passed after the
