@@ -168,6 +168,13 @@ Reviewing ~250 lines of `src/pyflows/orch.py`, cold cache:
 |---|---|---|---|
 | `--quick` | 2 | 0.06M | 45s |
 | full | 7 | 0.29M | 146s |
+| `--lenses 2` | 5 | 0.01M + 0.71M cached | 89s |
+
+`tokens` in the first rows is fresh input plus output, which is what the run
+summary used to print. It left out cache reads and writes, which are most of a
+run: the `--lenses 2` run above read 0.44M and wrote 0.27M cached tokens for
+14.5k of output, at $2.50 API cost. The summary now prints everything processed,
+cache included, plus the cost at API prices.
 
 Batching alone took the full run from 16 agents / 0.82M / 708s to 7 / 0.29M /
 146s with the same 9 findings surviving. Verification is the expensive half.
@@ -257,6 +264,13 @@ These are the rules the tests exist to protect. Each one is a bug that shipped.
   the wrong tree — green, and stale.
 - **Agents are confined.** `cwd` plus `disallowed_tools`. Not a jail — `Read`
   still takes absolute paths. For a real boundary use `can_use_tool`.
+- **One terminal record per agent, carrying that agent's usage.** Not the
+  run's running totals — the panel sums the records, so totals made N equal
+  calls read as N(N+1)/2 calls' worth. And exactly one: a schema retry or a
+  budget stop used to log an `ok` first, which claimed the panel row as `done`
+  and left the real outcome as an orphan row — an agent that never produced
+  valid output displayed as finished. A retried agent's record sums both calls
+  and says `retry: true`; a `FAIL` or `BUDGET` row still shows what it cost.
 - **Batched verdicts are paired by occurrence, not by label.** Labels repeat;
   keying on them merged two agents into one row and hung the second at
   `running` forever.

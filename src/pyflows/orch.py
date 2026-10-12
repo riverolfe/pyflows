@@ -94,7 +94,12 @@ class Stats:
         self.cost_usd = 0.0
         self.seconds = 0.0
 
-    def record(self, result: ResultMessage, label: str = "", retry: bool = False) -> None:
+    def record(self, result: ResultMessage) -> dict:
+        """Add one call's usage to the run totals and return that call's usage.
+
+        Does not log: ask() writes one terminal record per agent, carrying the
+        usage of its first call plus any retry.
+        """
         self.agents += 1
         # duration_api_ms is typed int but the CLI can emit JSON null, and
         # getattr's default does not cover an explicit None.
@@ -107,42 +112,72 @@ class Stats:
         # fields would latch the fallback off after the first non-empty one.
         got = (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
         if got:
-            self.input_tokens += usage.get("input_tokens") or 0
-            self.output_tokens += usage.get("output_tokens") or 0
-            self.cache_read += usage.get("cache_read_input_tokens") or 0
-            self.cache_write += usage.get("cache_creation_input_tokens") or 0
+            tok_in = usage.get("input_tokens") or 0
+            tok_out = usage.get("output_tokens") or 0
+            read = usage.get("cache_read_input_tokens") or 0
+            write = usage.get("cache_creation_input_tokens") or 0
         else:
+            tok_in = tok_out = read = write = 0
             for m in (getattr(result, "model_usage", None) or {}).values():
-                self.input_tokens += m.get("inputTokens", 0) or 0
-                self.output_tokens += m.get("outputTokens", 0) or 0
-                self.cache_read += m.get("cacheReadInputTokens", 0) or 0
-                self.cache_write += m.get("cacheCreationInputTokens", 0) or 0
-        _log_run(
-            {
-                "label": label,
-                "retry": retry,
-                "outcome": "ok",
-                "agents": self.agents,
-                "input": self.input_tokens,
-                "output": self.output_tokens,
-                "cache_read": self.cache_read,
-                "seconds": round(secs, 1),
-                "cost_usd": round(getattr(result, "total_cost_usd", None) or 0.0, 4),
-            }
-        )
+                tok_in += m.get("inputTokens", 0) or 0
+                tok_out += m.get("outputTokens", 0) or 0
+                read += m.get("cacheReadInputTokens", 0) or 0
+                write += m.get("cacheCreationInputTokens", 0) or 0
+        self.input_tokens += tok_in
+        self.output_tokens += tok_out
+        self.cache_read += read
+        self.cache_write += write
+        return {
+            "input": tok_in,
+            "output": tok_out,
+            "cache_read": read,
+            "cache_write": write,
+            "seconds": secs,
+            "cost_usd": getattr(result, "total_cost_usd", None) or 0.0,
+        }
 
     def note(self, label: str, outcome: str) -> None:
         _log_run({"label": label, "outcome": outcome, "agents": self.agents})
 
+    def finish(self, label: str, outcome: str, usage: dict, retry: bool = False) -> None:
+        """The one terminal record for an agent that made at least one call.
+
+        Exactly one per "started": a retry or a budget stop used to log an
+        extra "ok" first, which claimed the panel row as done and left the real
+        outcome as an orphan row — a dead agent displayed as finished. This
+        call's usage, not the run's running totals: the panel sums the records.
+        """
+        _log_run(
+            {
+                "label": label,
+                "retry": retry,
+                "outcome": outcome,
+                "agents": self.agents,
+                "input": usage["input"],
+                "output": usage["output"],
+                "cache_read": usage["cache_read"],
+                "seconds": round(usage["seconds"], 1),
+                "cost_usd": round(usage["cost_usd"], 4),
+            }
+        )
+
     def summary(self) -> str:
-        total = self.input_tokens + self.output_tokens
+        # Everything the model processed, cache included. Fresh input plus output
+        # alone read 0.01M for a run that processed 0.73M — cache reads and
+        # writes are most of a run, and most of what it costs.
+        total = self.input_tokens + self.output_tokens + self.cache_read + self.cache_write
         return (
             f"agents={self.agents} cache_hits={self.cache_hits} dead={self.dead}\n"
-            f"tokens: {total / 1e6:.2f}M total "
-            f"(in {self.input_tokens / 1e6:.2f}M / out {self.output_tokens / 1e3:.1f}k / "
+            f"tokens: {total / 1e6:.2f}M processed "
+            f"(fresh in {self.input_tokens / 1e6:.2f}M / out {self.output_tokens / 1e3:.1f}k / "
             f"cache read {self.cache_read / 1e6:.2f}M / write {self.cache_write / 1e6:.2f}M)\n"
+            f"cost: ${self.cost_usd:.2f} at API prices\n"
             f"api time: {self.seconds:.0f}s across {self.agents} agents"
         )
+
+
+def _add_usage(a: dict, b: dict) -> dict:
+    return {k: a[k] + b[k] for k in a}
 
 
 STATS = Stats()
@@ -343,23 +378,26 @@ async def ask(
         print(f"  stage failed [{label}]: {type(exc).__name__}: {exc}")
         return None
 
-    STATS.record(result, label)
+    usage = STATS.record(result)
     # Checked before structured_output, because a budget stop arrives as a
     # well-formed ResultMessage with is_error=True and no output — exactly the
     # shape of a dead agent. Counting that as dead makes "ran out of money"
     # report as "all lenses failed".
-    _raise_if_over_budget(result, label, max_budget_usd)
+    if _over_budget(result):
+        STATS.finish(label, "over_budget", usage)
+        _raise_budget(result, label, max_budget_usd)
     out = getattr(result, "structured_output", None)
     if out is None:
         STATS.dead += 1
-        STATS.note(label, "no_output")
+        STATS.finish(label, "no_output", usage)
         return None
 
     # The SDK hands back structured_output unvalidated. The JS runtime retries
     # on schema mismatch; here a malformed response would silently land in the
     # same None slot as a dead agent, so check it and give it one correction.
     error = _schema_error(out, schema)
-    if error is not None:
+    retried = error is not None
+    if retried:
         if spend is not None:
             spend.take()
         retry_prompt = (
@@ -372,34 +410,38 @@ async def ask(
                 result = await _run(retry_prompt, options)
         except Exception as exc:  # noqa: BLE001
             STATS.dead += 1
-            STATS.note(label, "failed_retry")
+            STATS.finish(label, "failed_retry", usage, retry=True)
             print(f"  stage failed [{label}] retry: {type(exc).__name__}: {exc}")
             return None
-        STATS.record(result, label, retry=True)
-        _raise_if_over_budget(result, f"{label} (retry)", max_budget_usd)
+        usage = _add_usage(usage, STATS.record(result))
+        if _over_budget(result):
+            STATS.finish(label, "over_budget", usage, retry=True)
+            _raise_budget(result, f"{label} (retry)", max_budget_usd)
         out = getattr(result, "structured_output", None)
         if out is None or (error := _schema_error(out, schema)) is not None:
             STATS.dead += 1
-            STATS.note(label, "invalid")
+            STATS.finish(label, "invalid", usage, retry=True)
             print(f"  stage invalid [{label}]: {error or 'no structured output'}")
             return None
 
+    STATS.finish(label, "ok", usage, retry=retried)
     if use_cache:
         CACHE.set(key, out)
     return out
 
 
-def _raise_if_over_budget(result: Any, label: str, max_budget_usd: float | None) -> None:
+def _over_budget(result: Any) -> bool:
+    return getattr(result, "subtype", "") == "error_max_budget_usd"
+
+
+def _raise_budget(result: Any, label: str, max_budget_usd: float | None) -> None:
     """Turn a CLI budget stop into BudgetExhausted instead of a dead stage.
 
     The CLI checks the ceiling between turns, so it can overshoot by the cost
     of one turn — $0.01 came back at $0.0322 in testing. Raise with the real
     spend, not the ceiling, or the message reads as "we spent $0.01".
     """
-    if getattr(result, "subtype", "") != "error_max_budget_usd":
-        return
     spent = getattr(result, "total_cost_usd", None) or 0.0
-    STATS.note(label, "over_budget")
     raise BudgetExhausted(
         f"stage {label!r} hit its ${max_budget_usd:g} budget after ${spent:.4f}"
         if max_budget_usd is not None
