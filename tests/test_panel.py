@@ -117,6 +117,13 @@ def test_render_uses_the_right_noun_for_each_mode():
     one = panel._render([{"outcome": "run_start", "target": "src", "mode": "quick", "lenses": 1}])
     assert "1 lens]" in one and "lenses]" not in one, one
 
+    # The bug: "lens" + "s" rendered "[full, 2 lenss]", and upgrade — which
+    # logs no count, its width is discovered at runtime — "[upgrade, None lenss]".
+    two = panel._render([{"outcome": "run_start", "target": "src", "mode": "full", "lenses": 2}])
+    assert "[full, 2 lenses]" in two, two
+    up = panel._render([{"outcome": "run_start", "target": ".", "mode": "upgrade", "lenses": None}])
+    assert "[upgrade]" in up, up
+
     # Questions are long and arbitrary, paths are short — an untruncated
     # question wraps the panel and pushes every stage column off the right.
     long_q = panel._render(
