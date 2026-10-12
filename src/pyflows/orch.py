@@ -12,9 +12,13 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
+import stat
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import diskcache
@@ -253,6 +257,7 @@ DEFAULT_EXTS = (
 # filesystem whose clock ticks coarser than this can stamp two writes alike.
 # 2s covers ext4's few-ms tick and FAT's 2s resolution.
 RACY_WINDOW_NS = 2_000_000_000
+RACY_HASH_MAX_BYTES = 16 * 1024 * 1024
 
 # Never fingerprinted: dependencies and build output, not the code under review.
 SKIP_DIRS = frozenset(
@@ -313,11 +318,16 @@ def stat_signature(root: str | Path, exts: tuple[str, ...] | None = None) -> str
             path = Path(dirpath, name)
             try:
                 st = path.stat()
-                part = f"{path}:{st.st_size}:{st.st_mtime_ns}"
-                if now - st.st_mtime_ns < RACY_WINDOW_NS:
-                    part += ":" + hashlib.sha256(path.read_bytes()).hexdigest()
             except OSError:
                 continue
+            if not stat.S_ISREG(st.st_mode):  # devices, fifos, links to them
+                continue
+            part = f"{path}:{st.st_size}:{st.st_mtime_ns}"
+            if now - st.st_mtime_ns < RACY_WINDOW_NS and st.st_size <= RACY_HASH_MAX_BYTES:
+                try:
+                    part += ":" + hashlib.sha256(path.read_bytes()).hexdigest()
+                except OSError:
+                    pass
             parts.append(part)
     parts.sort()  # walk order is filesystem order; the key must not depend on it
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
@@ -347,21 +357,24 @@ PATH_TOOLS = {"Read": ("file_path",), "Grep": ("path",), "Glob": ("path", "patte
 
 def _escapes(root: Path, tool: str, tool_input: dict, also: tuple[Path, ...] = ()) -> str | None:
     """The first path in `tool_input` outside `root` and every `also` dir, else None."""
-    base = root
+    allowed = (root, *also)
+    bases = (root, root)  # (symlinks resolved first, ".." applied first)
     for field in PATH_TOOLS.get(tool, ()):
         value = tool_input.get(field)
         if not value:
             continue
-        # resolve() follows symlinks: a link in the repo pointing at ~/.ssh
-        # resolves outside root and is denied, not read through. A Glob pattern
-        # is resolved whole, not cut at its first wildcard: "src/*/../../x" has
-        # an inside prefix and still climbs out — wildcard segments resolve as
-        # plain names, so the ".." after them is counted.
-        target = (base / Path(value).expanduser()).resolve()
-        if not any(target.is_relative_to(r) for r in (root, *also)):
+        # Both orders of resolving symlinks and "..": the CLI applies ".."
+        # lexically, Path.resolve() follows links first. Glob patterns are
+        # resolved whole, wildcards as plain names.
+        rel = Path(value).expanduser()
+        targets = (
+            (bases[0] / rel).resolve(),
+            Path(os.path.normpath(bases[1] / rel)).resolve(),
+        )
+        if not all(any(t.is_relative_to(r) for r in allowed) for t in targets):
             return str(value)
         if field == "path":
-            base = target  # Glob's pattern is relative to its path
+            bases = (targets[0], Path(os.path.normpath(bases[1] / rel)))
     return None
 
 
@@ -409,16 +422,57 @@ class Extensions:
 
     skills: tuple[str, ...] = ()
     plugins: tuple[str, ...] = ()
-    mcp: dict[str, dict] = dataclasses.field(default_factory=dict)
+    mcp: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     inherit: bool = False
 
+    def __post_init__(self) -> None:
+        """Validate, and freeze `mcp` all the way down. Raises ExtensionError."""
+        for name in ("skills", "plugins"):
+            value = getattr(self, name)
+            if isinstance(value, str) or not all(isinstance(v, str) for v in value):
+                raise ExtensionError(f"{name} must be a sequence of strings, got {value!r}")
+            object.__setattr__(self, name, tuple(value))
+        if not isinstance(self.mcp, Mapping) or not all(
+            isinstance(k, str) and isinstance(v, Mapping) for k, v in self.mcp.items()
+        ):
+            raise ExtensionError(f"mcp must map server names to config objects, got {self.mcp!r}")
+        try:
+            json.dumps(_thaw(self.mcp))
+        except (TypeError, ValueError) as exc:
+            raise ExtensionError(f"mcp config is not JSON: {exc}") from exc
+        object.__setattr__(self, "mcp", _freeze(self.mcp))
+
+    def __hash__(self) -> int:
+        return hash(self.key())
+
+    def mcp_servers(self) -> dict[str, Any]:
+        """A mutable copy of `mcp`."""
+        return _thaw(self.mcp)
+
     def key(self) -> str:
-        """Cache-key part: empty for the default, so isolated keys do not move."""
-        if self == Extensions():
+        """Cache-key part; empty for the default."""
+        if not (self.skills or self.plugins or self.mcp or self.inherit):
             return ""
         return json.dumps(
-            [sorted(self.skills), sorted(self.plugins), self.mcp, self.inherit], sort_keys=True
+            [sorted(self.skills), sorted(self.plugins), self.mcp_servers(), self.inherit],
+            sort_keys=True,
         )
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({k: _freeze(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(v) for v in value)
+    return value
+
+
+def _thaw(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {k: _thaw(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw(v) for v in value]
+    return value
 
 
 NO_EXTENSIONS = Extensions()
@@ -431,23 +485,43 @@ def _user_skill_plugin(names: tuple[str, ...]) -> Path:
         raise ExtensionError(f"no such user skill in {USER_SKILLS}: {', '.join(missing)}")
     digest = hashlib.sha256("|".join(sorted(names)).encode()).hexdigest()[:12]
     shim = Path(CACHE.directory) / "skill-shims" / digest
-    (shim / ".claude-plugin").mkdir(parents=True, exist_ok=True)
-    (shim / ".claude-plugin" / "plugin.json").write_text(
-        json.dumps({"name": SHIM_PLUGIN, "version": "0.0.0"})
-    )
-    (shim / "skills").mkdir(exist_ok=True)
-    for name in names:
-        link = shim / "skills" / name
-        if not link.is_symlink():
-            link.symlink_to(USER_SKILLS / name)
+    manifest = json.dumps({"name": SHIM_PLUGIN, "version": "0.0.0"})
+    try:
+        (shim / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+        meta = shim / ".claude-plugin" / "plugin.json"
+        if not meta.is_file() or meta.read_text() != manifest:
+            tmp = meta.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(manifest)
+            tmp.replace(meta)
+        (shim / "skills").mkdir(exist_ok=True)
+        for name in names:
+            link, target = shim / "skills" / name, USER_SKILLS / name
+            if link.is_symlink() and os.readlink(link) == str(target):
+                continue
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            try:
+                link.symlink_to(target)
+            except FileExistsError:  # another run made it first
+                if os.readlink(link) != str(target):
+                    raise
+    except OSError as exc:
+        raise ExtensionError(f"could not build the skill shim in {shim}: {exc}") from exc
     return shim
+
+
+def _plugin_name(path: Path) -> str:
+    try:
+        return json.loads((path / ".claude-plugin" / "plugin.json").read_text())["name"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return path.name
 
 
 def _extension_options(ext: Extensions) -> tuple[dict, list[str], tuple[Path, ...]]:
     """(ClaudeAgentOptions fields, extra allowed tools, extra read roots) for `ext`.
 
-    Raises ExtensionError on a plugin or skill that does not exist: a typo must
-    fail the run, not quietly run an agent without the skill it was given.
+    Raises ExtensionError on a plugin dir, user skill or plugin:skill that does
+    not exist. Skills are not checked under `inherit`.
     """
     plugins = []
     for p in ext.plugins:
@@ -457,14 +531,21 @@ def _extension_options(ext: Extensions) -> tuple[dict, list[str], tuple[Path, ..
         plugins.append(path)
     allowed = [f"mcp__{name}" for name in ext.mcp]
 
+    if not ext.inherit:
+        by_name = {_plugin_name(p): p for p in plugins}
+        for qualified in (n for n in ext.skills if ":" in n):
+            plugin, skill = qualified.split(":", 1)
+            if plugin not in by_name:
+                raise ExtensionError(f"skill {qualified}: plugin {plugin!r} not in --plugin")
+            if not (by_name[plugin] / "skills" / skill / "SKILL.md").is_file():
+                raise ExtensionError(f"skill {qualified}: no skills/{skill}/SKILL.md in {plugin}")
+
     if ext.inherit:
         skills: list[str] | str = list(ext.skills) or "all"
         reads = (*plugins, USER_SKILLS.resolve())
         fields: dict[str, Any] = {
-            # Explicit list: with skills set the SDK defaults to user+project,
-            # silently dropping settings.local.json.
             "setting_sources": ["user", "project", "local"],
-            "mcp_servers": dict(ext.mcp),
+            "mcp_servers": ext.mcp_servers(),
             "strict_mcp_config": False,
         }
     else:
@@ -474,7 +555,11 @@ def _extension_options(ext: Extensions) -> tuple[dict, list[str], tuple[Path, ..
             plugins.append(_user_skill_plugin(user))
             skills += [f"{SHIM_PLUGIN}:{n}" for n in user]
         reads = (*plugins, *((USER_SKILLS / n).resolve() for n in user))
-        fields = {"setting_sources": [], "mcp_servers": dict(ext.mcp), "strict_mcp_config": True}
+        fields = {
+            "setting_sources": [],
+            "mcp_servers": ext.mcp_servers(),
+            "strict_mcp_config": True,
+        }
 
     fields["plugins"] = [{"type": "local", "path": str(p)} for p in plugins]
     if skills:
@@ -586,7 +671,8 @@ async def ask(
         stat_signature(depends_on) if depends_on else "",
         ext.key(),
     )
-    if use_cache and (hit := CACHE.get(key)) is not None:
+    hit = _cache_get(key, label) if use_cache else None
+    if hit is not None:
         STATS.cache_hits += 1
         STATS.note(label, "cache_hit")
         return _clean(hit)  # entries cached before cleaning existed
@@ -645,7 +731,11 @@ async def ask(
     retried = error is not None
     if retried:
         if spend is not None:
-            spend.take()
+            try:
+                spend.take()
+            except BudgetExhausted:
+                STATS.finish(label, "over_budget", usage)
+                raise
         retry_prompt = (
             f"{prompt}\n\nYour previous response did not satisfy the required "
             f"schema: {error}\nReturn corrected JSON matching this schema exactly:\n"
@@ -674,8 +764,28 @@ async def ask(
     # Cleaned once here, so no workflow has to remember to before printing.
     out = _clean(out)
     if use_cache:
-        CACHE.set(key, out)
+        _cache_set(key, out, label)
     return out
+
+
+_CACHE_ERRORS = (OSError, sqlite3.Error, ValueError, EOFError)
+
+
+def _cache_get(key: str, label: str) -> Any:
+    """CACHE.get, or None with a warning if the cache cannot be read."""
+    try:
+        return CACHE.get(key)
+    except _CACHE_ERRORS as exc:
+        print(f"  cache read failed [{label}]: {type(exc).__name__}: {exc}")
+        return None
+
+
+def _cache_set(key: str, value: Any, label: str) -> None:
+    """CACHE.set, with a warning instead of an exception on failure."""
+    try:
+        CACHE.set(key, value)
+    except _CACHE_ERRORS as exc:
+        print(f"  cache write failed [{label}]: {type(exc).__name__}: {exc}")
 
 
 def _over_budget(result: Any) -> bool:
@@ -718,16 +828,15 @@ async def _run(prompt: str, options: ClaudeAgentOptions) -> ResultMessage:
 
 
 async def gather(coros: list[Any]) -> list[Any]:
-    """asyncio.gather that swallows per-item failures the way JS parallel() does.
+    """asyncio.gather with None in the slot of every call that raised.
 
-    Returns a list with None in the slot of every call that failed. A blown
-    budget is not a dead stage — it re-raises, or the ceiling reads as a short
-    result set instead of a stopped run.
+    BudgetExhausted and ExtensionError re-raise. Other exceptions are printed.
     """
     results = await asyncio.gather(*coros, return_exceptions=True)
     for r in results:
-        # A bad extension is a config error, identical in every slot: as None
-        # it would report "all lenses failed" for a typo in --skill.
         if isinstance(r, (BudgetExhausted, ExtensionError)):
             raise r
+    for r in results:
+        if isinstance(r, BaseException):
+            print(f"  stage raised: {type(r).__name__}: {r}")
     return [None if isinstance(r, BaseException) else r for r in results]

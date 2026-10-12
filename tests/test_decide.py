@@ -7,6 +7,7 @@ import jsonschema
 import pytest
 
 import pyflows.examples.decide as dc
+import pyflows.orch as orch
 from conftest import patched
 
 
@@ -138,15 +139,13 @@ def test_an_odd_field_gives_the_last_option_a_bye():
 
 
 def test_the_winner_index_reads_the_presented_order_not_the_argument_order():
-    # Judges see "Candidate 0/1" with no names, so index 0 means whatever was
-    # presented first — which is seeded, so it is not necessarily options[0].
     for index in (0, 1):
         fake, prompts = _tournament(winner=index)
         with patched(dc, "ask", fake):
             brief = asyncio.run(dc.decide("which db?", ["alpha", "beta"]))
         judge = next(p for p in prompts if "Pick the stronger" in p)
-        shown = re.findall(r"\[(\d)\] (\w+)", judge)
-        assert brief["winner"]["option"] == shown[index][1]
+        shown = re.findall(r"Plan: do (\w+)", judge)
+        assert brief["winner"]["option"] == shown[index]
 
 
 def test_a_judge_that_names_an_out_of_range_candidate_fails_validation():
@@ -172,9 +171,6 @@ def test_a_cap_that_would_leave_no_tournament_is_refused(capsys):
 
 
 def test_a_field_that_never_got_entered_is_not_a_clean_run(capsys):
-    # The comment above the cap names this as the lie to avoid, and upgrade()
-    # honours the same rule. 4 options with --max 2 enters half the field; a
-    # winner from 2 of 4 is not a decision between 4.
     fake, _ = _tournament()
     with patched(dc, "ask", fake):
         code = dc.main(["which?", "a", "b", "c", "d", "--max", "2"])
@@ -189,3 +185,75 @@ def test_a_cap_above_the_field_size_does_not_claim_a_truncation(capsys):
     with patched(dc, "ask", fake):
         assert dc.main(["which?", "a", "b", "--max", "99"]) == 0
     assert "capped" not in capsys.readouterr().out
+
+
+def test_judges_see_candidates_not_option_names_and_no_agent_gets_tools():
+    seen = []
+    fake, prompts = _tournament(winner=0)
+
+    async def spy(prompt, schema, **kw):
+        seen.append(kw.get("tools"))
+        return await fake(prompt, schema, **kw)
+
+    with patched(dc, "ask", spy):
+        asyncio.run(dc.decide("which db?", ["alpha", "beta", "gamma"]))
+
+    judges = [p for p in prompts if "Pick the stronger" in p]
+    assert judges
+    for judge in judges:
+        headings = re.findall(r"^\[\d\] (.+)$", judge, flags=re.M)
+        assert headings == ["Candidate 0", "Candidate 1"], headings
+    assert seen and all(t == () for t in seen), seen
+
+
+GRANT = orch.Extensions(skills=("s",), inherit=True)
+
+
+def _exts_seen(fake):
+    seen = []
+
+    async def spy(prompt, schema, **kw):
+        seen.append(kw.get("ext"))
+        return await fake(prompt, schema, **kw)
+
+    return spy, seen
+
+
+def test_every_decide_agent_gets_the_granted_extensions():
+    fake, _ = _tournament()
+    spy, seen = _exts_seen(fake)
+    with patched(dc, "ask", spy):
+        asyncio.run(dc.decide("q", ["a", "b", "c"], ext=GRANT))
+    assert len(seen) == 5 and all(e is GRANT for e in seen), seen
+
+
+@pytest.mark.parametrize("kw", [{"dead_judges": (0,)}, {"dead_options": ("b",)}])
+def test_a_provisional_or_short_field_decision_exits_non_zero(kw):
+    fake, _ = _tournament(**kw)
+    with patched(dc, "ask", fake):
+        assert dc.main(["which?", "a", "b", "c"]) == 1
+
+
+def test_a_clean_decision_exits_zero():
+    fake, _ = _tournament()
+    with patched(dc, "ask", fake):
+        assert dc.main(["which?", "a", "b", "c"]) == 0
+
+
+@pytest.mark.parametrize("extra", [[], ["--max", "30"]])
+def test_the_field_is_capped_to_the_call_budget(extra, capsys):
+    options = [f"o{i}" for i in range(30)]
+    fake, prompts = _tournament()
+    with patched(dc, "ask", fake):
+        code = dc.main(["which?", *options, *extra])
+    fits = (dc.MAX_CALLS + 1) // 2
+    assert f"only {fits}/30 fit the budget" in capsys.readouterr().out
+    assert len([p for p in prompts if "strongest honest case" in p]) == fits
+    assert code == 1
+
+
+def test_presentation_order_is_stable_and_not_argument_order():
+    opts = [{"option": f"o{i}"} for i in range(8)]
+    pairs = [(a, b) for a in opts for b in opts if a is not b]
+    assert all(dc._order(a, b) == dc._order(b, a) for a, b in pairs)
+    assert any(dc._order(a, b)[0] is b for a, b in pairs)

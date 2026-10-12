@@ -99,7 +99,8 @@ async def review(
     batch_size: int | None = None,
     ext: Extensions = NO_EXTENSIONS,
 ) -> dict:
-    """Return {"confirmed": findings that survived, "unconfirmed": count never judged}.
+    """Return {"confirmed": findings that survived, "unconfirmed": count never judged,
+    "dead": lenses that failed}.
 
     Unconfirmed is returned, not just printed: a run whose verifier died is a
     partial review, and `main` must not exit 0 over findings nobody checked.
@@ -147,7 +148,7 @@ async def review(
     # no batches, `any([])` below would report "all 0 verification batches failed".
     if not unique:
         print(f"no findings from {len(alive)}/{len(lenses)} lenses")
-        return {"confirmed": [], "unconfirmed": 0}
+        return {"confirmed": [], "unconfirmed": 0, "dead": len(lenses) - len(alive)}
 
     print(f"{len(unique)} unique findings from {len(alive)}/{len(lenses)} lenses, verifying…")
 
@@ -201,7 +202,7 @@ async def review(
     if not any(results):
         raise ReviewFailed(f"all {len(batches)} verification batches failed")
 
-    return {"confirmed": confirmed, "unconfirmed": unconfirmed}
+    return {"confirmed": confirmed, "unconfirmed": unconfirmed, "dead": len(lenses) - len(alive)}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -301,16 +302,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"review did not complete: {exc}\n{STATS.summary()}")
         return 1
 
-    confirmed, unconfirmed = result["confirmed"], result["unconfirmed"]
+    confirmed, unconfirmed, dead = result["confirmed"], result["unconfirmed"], result["dead"]
     for f in confirmed:
         print(f"\n{f['file']}:{f['line']}  {f['summary']}\n  {f['reason']}")
     print(f"\n{len(confirmed)} confirmed" if confirmed else "nothing survived verification")
     if unconfirmed:
         print(f"{unconfirmed} findings NOT verified — this review is partial, not clean")
+    if dead:
+        print(f"{dead}/{len(lenses)} lenses failed — this review is partial, not clean")
     print(STATS.summary())
     print(f"wall clock: {time.monotonic() - started:.0f}s")
     # Same rule as a dead lens: findings nobody judged are not findings refuted.
-    return 1 if unconfirmed else 0
+    return 1 if unconfirmed or dead else 0
 
 
 if __name__ == "__main__":

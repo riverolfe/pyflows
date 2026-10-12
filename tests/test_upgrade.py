@@ -6,6 +6,7 @@ import jsonschema
 import pytest
 
 import pyflows.examples.upgrade as up
+import pyflows.orch as orch
 from conftest import patched
 
 DEP = {"name": "django", "current": "4.2", "direct": True, "uses": 12}
@@ -428,3 +429,92 @@ def test_missing_manifest_exits_before_spending_anything(tmp_path, capsys):
 
     assert up.main([str(tmp_path)]) == 1
     assert "no manifest" in capsys.readouterr().out
+
+
+def test_a_dead_dependency_agent_is_not_a_clean_audit(tmp_path, capsys):
+    (tmp_path / "pyproject.toml").write_text("")
+    fake, _ = _agents([])
+
+    async def one_dead(prompt, schema, **kw):
+        if "`requests`" in prompt:
+            return None
+        return await fake(prompt, schema, **kw)
+
+    with patched(up, "ask", one_dead):
+        code = up.main([str(tmp_path), "--no-verify"])
+
+    text = capsys.readouterr().out
+    assert code == 1
+    assert "1/3 dependency agents failed" in text and "safe to bump" not in text, text
+
+
+GRANT = orch.Extensions(skills=("s",), inherit=True)
+
+
+def _exts_seen(fake):
+    seen = []
+
+    async def spy(prompt, schema, **kw):
+        seen.append(kw.get("ext"))
+        return await fake(prompt, schema, **kw)
+
+    return spy, seen
+
+
+def test_every_upgrade_agent_gets_the_granted_extensions():
+    fake, _ = _agents([BREAK])
+    spy, seen = _exts_seen(fake)
+    with patched(up, "ask", spy):
+        asyncio.run(up.upgrade(".", ext=GRANT))
+    # inventory + 3 dependency agents + 1 verifier
+    assert len(seen) == 5 and all(e is GRANT for e in seen), seen
+
+
+def test_verdicts_bind_by_index_not_by_position():
+    other = {**BREAK, "file": "app/models.py", "line": 7}
+
+    async def fake(prompt, schema, **kw):
+        if "REFUTE" in prompt:
+            return {
+                "verdicts": [
+                    {"index": 1, "breaks_here": True, "reason": "views break"},
+                    {"index": 0, "breaks_here": False, "reason": "models fine"},
+                    {"index": 5, "breaks_here": True, "reason": "out of range"},
+                ]
+            }
+        f, _ = _agents([BREAK, other])
+        return await f(prompt, schema, **kw)
+
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", limit=1))
+
+    confirmed = [(e["finding"]["file"], e["why"]) for e in out["confirmed"]]
+    # Verifier sees findings sorted by file: [0] models.py, [1] views.py.
+    assert confirmed == [("app/views.py", "views break")], out
+    assert [e["finding"]["file"] for e in out["refuted"]] == ["app/models.py"], out
+
+
+def test_budget_skipped_dependencies_fail_the_exit_code(tmp_path, capsys):
+    (tmp_path / "pyproject.toml").write_text("")
+    many = [{"name": f"p{i}", "current": "1", "direct": True, "uses": i} for i in range(40)]
+
+    async def fake(prompt, schema, **kw):
+        if "manifest" in prompt:
+            return {"manifest": "pyproject.toml", "dependencies": many}
+        return {"findings": [], "sources_checked": ["https://x"]}
+
+    with patched(up, "ask", fake):
+        code = up.main([str(tmp_path), "--no-verify"])
+    text = capsys.readouterr().out
+    assert code == 1
+    assert "skipped by the call budget" in text and "safe to bump" not in text, text
+
+
+def test_a_break_without_a_url_is_unconfirmed_not_dropped(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("")
+    fake, _ = _agents([{**BREAK, "url": ""}])
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(str(tmp_path), limit=1))
+        code = up.main([str(tmp_path), "--limit", "1"])
+    assert [e["why"] for e in out["unconfirmed"]] == ["no changelog URL"], out
+    assert code == 1

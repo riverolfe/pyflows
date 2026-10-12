@@ -195,10 +195,11 @@ async def upgrade(
     # when the run cannot cover everything it found. Silently auditing the
     # first 12 of 40 dependencies reads as "these 12 are the only ones".
     # Two calls per dependency — one upgrade agent, one verification batch.
-    capped = ""
+    capped, skipped = "", 0
     if not limit and len(deps) * 2 > spend.remaining:
         room = max(1, spend.remaining // 2)
         capped = f"\n  {len(deps)} dependencies found, {room} fit the budget — rest skipped"
+        skipped = len(deps) - room
         deps = deps[:room]
     print(f"auditing {len(deps)} dependencies in {target}{capped}")
 
@@ -258,10 +259,11 @@ async def upgrade(
                 seen.add(key)
                 findings.append(f)
 
-    quoted = sum(1 for f in findings if not f.get("url"))
-    if quoted:
-        print(f"  {quoted} findings had no changelog URL and cannot be verified — dropped")
+    no_url = [f for f in findings if not f.get("url")]
+    if no_url:
+        print(f"  {len(no_url)} findings had no changelog URL and cannot be verified")
         findings = [f for f in findings if f.get("url")]
+    no_url_entries = [{"finding": f, "why": "no changelog URL"} for f in no_url]
 
     print(f"{len(findings)} candidate breaks from {len(alive)}/{len(deps)} agents")
     result = {
@@ -269,12 +271,14 @@ async def upgrade(
         "dependencies": deps,
         "audited": len(checked),
         "unchecked": len(blanked),
+        "dead": len(deps) - len(alive),
+        "skipped": skipped,
         "findings": findings,
         "confirmed": [],
         "refuted": [],
         # Never verified: no verdict came back, or the claim was never sent.
         # Not refuted — "safe to bump" over these is a guess, not a finding.
-        "unconfirmed": [],
+        "unconfirmed": list(no_url_entries),
     }
 
     # Nothing was actually checked. Say so rather than reporting the deps safe.
@@ -286,13 +290,13 @@ async def upgrade(
         )
 
     if not verify or not findings:
-        result["unconfirmed"] = [{"finding": f, "why": "verification skipped"} for f in findings]
+        result["unconfirmed"] += [{"finding": f, "why": "verification skipped"} for f in findings]
         result["elapsed"] = time.monotonic() - started
         return result
 
     ranked = sorted(findings, key=lambda f: (f["dependency"], f["file"]))
     targets = ranked[:depth]
-    result["unconfirmed"] = [{"finding": f, "why": "beyond --depth"} for f in ranked[depth:]]
+    result["unconfirmed"] += [{"finding": f, "why": "beyond --depth"} for f in ranked[depth:]]
     print(f"checking {len(targets)} of {len(findings)} candidate breaks…")
 
     # One verifier per batch, like review: reading the repo again per finding
@@ -381,13 +385,22 @@ def render(brief: dict) -> None:
     unconfirmed = brief.get("unconfirmed") or []
     if unconfirmed:
         print(
-            f"\n{len(unconfirmed)}/{len(brief['findings'])} candidate breaks were NOT verified "
-            f"(dead or skipped verifier, beyond --depth, or --no-verify):"
+            f"\n{len(unconfirmed)} candidate breaks were NOT verified "
+            f"(dead or skipped verifier, beyond --depth, --no-verify, or no changelog URL):"
         )
         for entry in unconfirmed:
             f = entry["finding"]
             print(f"  {f['dependency']}  {f['file']}:{f['line']}  {f['summary']}  [{entry['why']}]")
-    if not brief["confirmed"] and not unchecked and not unconfirmed:
+    dead = brief.get("dead") or 0
+    if dead:
+        print(
+            f"\n{dead}/{len(brief['dependencies'])} dependency agents failed — "
+            f"those dependencies were NOT audited."
+        )
+    skipped = brief.get("skipped") or 0
+    if skipped:
+        print(f"\n{skipped} dependencies were skipped by the call budget — NOT audited.")
+    if not brief["confirmed"] and not (unchecked or unconfirmed or dead or skipped):
         print("no confirmed breaks — the deps look safe to bump")
 
 
@@ -431,10 +444,8 @@ def main(argv: list[str] | None = None) -> int:
     render(brief)
     print(f"\n{STATS.summary()}")
     print(f"wall clock: {time.monotonic() - started:.0f}s")
-    # A partial audit is not a clean one — same rule the other two examples
-    # follow, and the reason `main` must not exit 0 over unchecked deps or
-    # candidate breaks nobody verified.
-    return 1 if brief.get("unchecked") or brief.get("unconfirmed") else 0
+    partial = ("unchecked", "unconfirmed", "dead", "skipped")
+    return 1 if any(brief.get(k) for k in partial) else 0
 
 
 if __name__ == "__main__":

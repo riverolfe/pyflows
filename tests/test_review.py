@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 import pyflows.examples.review as cr
+import pyflows.orch as orch
 from conftest import FINDING, patched
 
 
@@ -48,7 +49,7 @@ def test_skipped_verdict_is_unconfirmed_not_confirmed(monkeypatch):
 
     with patched(cr, "ask", fake):
         out = asyncio.run(cr.review("."))
-    assert out == {"confirmed": [], "unconfirmed": 2}, out
+    assert out == {"confirmed": [], "unconfirmed": 2, "dead": 0}, out
 
 
 def test_all_lenses_dead_is_not_a_clean_run():
@@ -76,12 +77,10 @@ def test_live_lenses_with_no_findings_is_a_clean_run():
         return {"findings": []}
 
     with patched(cr, "ask", fake):
-        assert asyncio.run(cr.review(".")) == {"confirmed": [], "unconfirmed": 0}
+        assert asyncio.run(cr.review(".")) == {"confirmed": [], "unconfirmed": 0, "dead": 0}
 
 
-def test_review_survives_a_partially_dead_fleet():
-    # One dead lens among four must not sink the run, and must not silently
-    # become "this lens found nothing".
+def test_review_survives_a_partially_dead_fleet(tmp_path, capsys):
     calls = []
 
     async def flaky(prompt, schema, **kw):
@@ -93,7 +92,24 @@ def test_review_survives_a_partially_dead_fleet():
         return {"findings": [FINDING]}
 
     with patched(cr, "ask", flaky):
-        assert asyncio.run(cr.review("."))["confirmed"] == []
+        out = asyncio.run(cr.review("."))
+        calls.clear()
+        code = cr.main(["review", str(tmp_path), "--lenses", "2"])
+
+    assert out["confirmed"] == [] and out["dead"] == 1, out
+    assert code == 1
+    assert "1/2 lenses failed" in capsys.readouterr().out
+
+
+def test_dead_lenses_beside_empty_ones_are_not_a_clean_run(tmp_path):
+    calls = []
+
+    async def fake(prompt, schema, **kw):
+        calls.append(prompt)
+        return None if len(calls) == 1 else {"findings": []}
+
+    with patched(cr, "ask", fake):
+        assert cr.main(["review", str(tmp_path), "--lenses", "2"]) == 1
 
 
 def test_quick_mode_uses_one_lens_and_one_verifier(monkeypatch):
@@ -149,3 +165,45 @@ def test_a_fully_refuted_review_exits_zero(tmp_path):
 
     with patched(cr, "ask", fake):
         assert cr.main(["review", str(tmp_path), "--lenses", "1"]) == 0
+
+
+GRANT = orch.Extensions(skills=("s",), inherit=True)
+
+
+def _exts_seen(fake):
+    seen = []
+
+    async def spy(prompt, schema, **kw):
+        seen.append(kw.get("ext"))
+        return await fake(prompt, schema, **kw)
+
+    return spy, seen
+
+
+def test_every_review_agent_gets_the_granted_extensions():
+    async def fake(prompt, schema, **kw):
+        if "REFUTE" in prompt:
+            return {"verdicts": [{"index": 0, "refuted": True, "reason": "no"}]}
+        return {"findings": [FINDING]}
+
+    spy, seen = _exts_seen(fake)
+    with patched(cr, "ask", spy):
+        asyncio.run(cr.review(".", ext=GRANT))
+    assert len(seen) == len(cr.LENSES) + 1 and all(e is GRANT for e in seen), seen
+
+
+def test_the_cli_forwards_extension_flags_to_every_workflow(monkeypatch):
+    import pyflows.examples.decide as dc
+    import pyflows.examples.research as rs
+    import pyflows.examples.upgrade as up
+
+    got = {}
+    for name, mod in (("research", rs), ("upgrade", up), ("decide", dc)):
+        monkeypatch.setattr(mod, "main", lambda argv, name=name: got.setdefault(name, argv) and 0)
+
+    flags = ["--skill", "s", "--plugin", "/p", "--inherit-settings"]
+    cr.main(["research", "q", *flags])
+    cr.main(["upgrade", ".", *flags])
+    cr.main(["decide", "q", "a", "b", *flags])
+    for name in ("research", "upgrade", "decide"):
+        assert got[name][-len(flags) :] == flags, (name, got[name])
