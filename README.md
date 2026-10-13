@@ -40,6 +40,7 @@ In CI, set `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`.
 pyflows review src              # 4 lenses, batched verification
 pyflows review src --quick      # 1 lens, 1 verifier — ~4× cheaper
 pyflows review src --lenses 2   # middle ground
+pyflows review src --lens performance --lens error-handling   # pick lenses by name
 
 pyflows research "your question"           # multi-modal sweep → synthesize → verify
 pyflows research "q" --angles 2 --depth 3  # fewer angles, more citations checked

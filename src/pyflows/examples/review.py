@@ -217,6 +217,13 @@ def main(argv: list[str] | None = None) -> int:
         help="one lens, one verifier — cheap, but no independent cross-check",
     )
     rev.add_argument("--lenses", type=int, default=None, help="limit finder agents")
+    rev.add_argument(
+        "--lens",
+        action="append",
+        choices=LENSES,
+        default=None,
+        help="run this lens (repeatable); --lenses then caps the chosen list",
+    )
     add_extension_args(rev)
 
     ag = sub.add_parser("agents", help="browse agents from past runs")
@@ -286,7 +293,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no such path: {target}")
         return 1
 
-    lenses = LENSES[: args.lenses] if args.lenses else (QUICK_LENSES if args.quick else LENSES)
+    chosen = tuple(dict.fromkeys(args.lens)) if args.lens else None
+    lenses = chosen or (QUICK_LENSES if args.quick else LENSES)
+    if args.lenses:
+        lenses = (chosen or LENSES)[: args.lenses]
     # Quick mode forces one batch regardless of how many findings turn up.
     batch_size = MAX_CALLS if args.quick else None
 
