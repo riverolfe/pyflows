@@ -256,4 +256,17 @@ def test_presentation_order_is_stable_and_not_argument_order():
     opts = [{"option": f"o{i}"} for i in range(8)]
     pairs = [(a, b) for a in opts for b in opts if a is not b]
     assert all(dc._order(a, b) == dc._order(b, a) for a, b in pairs)
-    assert any(dc._order(a, b)[0] is b for a, b in pairs)
+    # Not alphabetical either: across pairs, the name that sorts first is shown first only sometimes.
+    firsts = {dc._order(a, b)[0] is min(a, b, key=lambda o: o["option"]) for a, b in pairs}
+    assert firsts == {True, False}
+
+
+def test_duplicate_options_collapse_and_one_distinct_option_is_refused(capsys):
+    fake, prompts = _tournament()
+    with patched(dc, "ask", fake):
+        assert dc.main(["which?", "a", "a"]) == 1
+        assert "need at least two distinct options" in capsys.readouterr().out
+        assert prompts == []
+        dc.main(["which?", "a", "b", "a"])
+    advocates = [p for p in prompts if "strongest honest case" in p]
+    assert len(advocates) == 2

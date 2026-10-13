@@ -138,15 +138,24 @@ def test_ask_passes_reads_to_the_confinement_hook(tmp_path):
         captured["options"] = options
         raise RuntimeError("stop here — we only inspect the options")
 
+    root = tmp_path / "repo"
     extra = tmp_path / "evidence"
+    root.mkdir()
     extra.mkdir()
     with patched(orch, "_run", fake_run):
-        asyncio.run(orch.ask("p", {"type": "object"}, use_cache=False, reads=(extra,)))
+        asyncio.run(orch.ask("p", {"type": "object"}, use_cache=False, cwd=root, reads=(extra,)))
 
     (matcher,) = captured["options"].hooks["PreToolUse"]
     (hook,) = matcher.hooks
-    probe = {"tool_name": "Read", "tool_input": {"file_path": str(extra / "a.log")}}
-    assert asyncio.run(hook(probe, None, None)) == {}
+
+    def probe(path):
+        out = asyncio.run(
+            hook({"tool_name": "Read", "tool_input": {"file_path": str(path)}}, None, None)
+        )
+        return out.get("hookSpecificOutput", {}).get("permissionDecision", "allow")
+
+    assert probe(extra / "a.log") == "allow"
+    assert probe(tmp_path / "secret.env") == "deny"
 
 
 def test_ask_installs_the_confinement_hook_for_every_path_tool():
@@ -212,7 +221,9 @@ def test_stat_signature_catches_an_edit_the_clock_did_not_see(tmp_path):
 
     src.write_text("x = 2\n")
     os.utime(src, ns=(stamp, stamp))
-    assert stat_signature(tmp_path) != before
+    # The clock is pinned inside the window, so a slow run cannot leave it.
+    with patched(orch.time, "time_ns", lambda: stamp + 1):
+        assert stat_signature(tmp_path) != before
 
     # Outside the window the stat is trusted and the file is not read — the
     # cheap path the fingerprint exists for. Hashing everything would pass the
@@ -778,6 +789,93 @@ def test_gather_prints_what_it_swallows(capsys):
 
 
 def test_stat_signature_skips_files_that_are_not_regular(tmp_path):
-    os.mkfifo(tmp_path / "trap.py")  # a fresh fifo: reading it would block
+    import threading
+
     (tmp_path / "real.py").write_text("x")
-    assert stat_signature(tmp_path) == stat_signature(tmp_path)
+    without = stat_signature(tmp_path)
+    os.mkfifo(tmp_path / "trap.py")  # a fresh fifo: reading it would block
+    got = []
+    worker = threading.Thread(target=lambda: got.append(stat_signature(tmp_path)), daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    if worker.is_alive():
+        with open(tmp_path / "trap.py", "w"):  # unblock the reader before failing
+            pass
+        pytest.fail("stat_signature blocked reading a fifo")
+    assert got == [without]
+
+
+def test_run_keeps_the_last_result_and_fails_without_one(monkeypatch):
+    first, last = message(result="first"), message(result="last")
+
+    def stream(*items):
+        async def query(prompt, options):
+            for item in items:
+                yield item
+
+        return query
+
+    monkeypatch.setattr(orch, "query", stream("progress", first, "more", last))
+    assert asyncio.run(orch._run("p", cast(Any, None))) is last
+    monkeypatch.setattr(orch, "query", stream("progress"))
+    with pytest.raises(RuntimeError, match="without a result message"):
+        asyncio.run(orch._run("p", cast(Any, None)))
+
+
+def test_a_retry_that_raises_is_a_dead_agent():
+    calls = []
+
+    async def bad_then_raise(prompt, options):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return message(structured_output={"wrong": "shape"})
+        raise RuntimeError("connection lost")
+
+    schema = {"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]}
+    with patched(orch, "_run", bad_then_raise):
+        assert asyncio.run(orch.ask("p", schema, use_cache=False, label="flaky")) is None
+    assert len(calls) == 2 and orch.STATS.dead == 1
+    outcomes = [r.get("outcome") for r in map(json.loads, orch.RUN_LOG.read_text().splitlines())]
+    assert outcomes[-1] == "failed_retry"
+
+
+def test_a_retry_over_the_per_call_ceiling_is_budget_exhausted():
+    calls = []
+
+    async def bad_then_broke(prompt, options):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return message(structured_output={"wrong": "shape"})
+        return message(subtype="error_max_budget_usd", is_error=True)
+
+    schema = {"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]}
+    with patched(orch, "_run", bad_then_broke), pytest.raises(orch.BudgetExhausted):
+        asyncio.run(orch.ask("p", schema, use_cache=False, max_budget_usd=0.01))
+    assert len(calls) == 2
+
+
+def test_stats_fall_back_to_per_model_usage():
+    stats = orch.Stats()
+    per_model = {
+        "a": {
+            "inputTokens": 10,
+            "outputTokens": 2,
+            "cacheReadInputTokens": 5,
+            "cacheCreationInputTokens": 1,
+        },
+        "b": {"inputTokens": 7, "outputTokens": 3},
+    }
+    used = stats.record(message(usage={}, model_usage=per_model))
+    assert (stats.input_tokens, stats.output_tokens) == (17, 5)
+    assert used["input"] == 17 and used["output"] == 5
+    stats.record(message(usage={"input_tokens": 4, "output_tokens": 1}, model_usage=per_model))
+    assert (stats.input_tokens, stats.output_tokens) == (21, 6)
+
+
+def test_read_runs_splits_at_each_run_start():
+    for target in ("first", "second", "third"):
+        orch._log_run({"outcome": "run_start", "target": target, "mode": "full", "lenses": 1})
+        orch._log_run({"label": f"find/{target}", "outcome": "ok"})
+    runs = orch.read_runs()
+    assert [r[0]["target"] for r in runs] == ["first", "second", "third"]
+    assert all(len(r) == 2 for r in runs)

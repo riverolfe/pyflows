@@ -270,6 +270,7 @@ def test_test_quality_runs_only_when_named(tmp_path):
     with patched(cr, "ask", _recording(prompts)):
         cr.main(["review", str(tmp_path)])
         cr.main(["review", str(tmp_path), "--lenses", "4"])
+        cr.main(["review", str(tmp_path), "--lenses", "5"])
     finders = [kw["label"] for p, kw in prompts if "REFUTE" not in p]
     assert finders and not any("test-quality" in label for label in finders)
     assert all("Claims marked [test-quality]" not in p for p, _ in prompts)
@@ -334,3 +335,55 @@ def test_a_coverage_gap_and_a_bug_on_the_same_line_are_both_verified(tmp_path, c
     assert code == 0
     out = capsys.readouterr().out
     assert "2 confirmed" in out and f"[test-quality] {FINDING['file']}:{FINDING['line']}" in out
+
+
+def test_the_cli_forwards_each_workflows_own_flags(monkeypatch):
+    import pyflows.examples.decide as dc
+    import pyflows.examples.research as rs
+    import pyflows.examples.upgrade as up
+
+    got = {}
+    for name, mod in (("research", rs), ("upgrade", up), ("decide", dc)):
+        monkeypatch.setattr(mod, "main", lambda argv, name=name: got.setdefault(name, argv) and 0)
+
+    cr.main(["research", "q", "--angles", "2", "--depth", "1", "--no-verify"])
+    cr.main(["upgrade", "src", "--depth", "2", "--limit", "3", "--no-verify"])
+    cr.main(["decide", "q", "a", "b", "--max", "0"])
+    assert got["research"][:2] == ["research", "q"]
+    assert {"--no-verify"} <= set(got["research"]) and _pair(got["research"], "--angles") == "2"
+    assert _pair(got["research"], "--depth") == "1"
+    assert got["upgrade"][0] == "src" and "--no-verify" in got["upgrade"]
+    assert _pair(got["upgrade"], "--depth") == "2" and _pair(got["upgrade"], "--limit") == "3"
+    assert _pair(got["decide"], "--max") == "0"
+
+
+def _pair(argv, flag):
+    return argv[argv.index(flag) + 1] if flag in argv else None
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        cr.ReviewFailed("all 4 lenses failed"),
+        cr.BudgetExhausted("out"),
+        cr.ExtensionError("no skill"),
+    ],
+)
+def test_review_errors_exit_one_with_the_reason(tmp_path, capsys, exc):
+    async def boom(*a, **kw):
+        raise exc
+
+    with patched(cr, "review", boom):
+        assert cr.main(["review", str(tmp_path)]) == 1
+    assert f"review did not complete: {exc}" in capsys.readouterr().out
+
+
+def test_a_missing_review_target_is_refused_before_any_agent(tmp_path, capsys):
+    calls = []
+
+    async def fake(*a, **kw):
+        calls.append(a)
+
+    with patched(cr, "ask", fake):
+        assert cr.main(["review", str(tmp_path / "nope")]) == 1
+    assert calls == [] and "no such path" in capsys.readouterr().out

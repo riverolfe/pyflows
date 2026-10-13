@@ -271,3 +271,32 @@ def test_a_brief_with_no_checkable_citation_is_not_a_clean_run(capsys):
     text = capsys.readouterr().out
     assert code == 1
     assert "No citation could be checked" in text and "held up" not in text, text
+
+
+def test_a_dead_synthesizer_is_a_failed_run(capsys):
+    async def fake(prompt, schema, **kw):
+        if "Synthesize" in prompt:
+            return None
+        return {"findings": [{"claim": "c", "source": "http://a", "confidence": "high"}]}
+
+    with patched(research, "ask", fake):
+        with pytest.raises(research.ResearchFailed, match="synthesis failed"):
+            asyncio.run(research.research("q", verify=False))
+        assert research.main(["research", "q", "--no-verify"]) == 1
+    assert "research did not complete: synthesis failed" in capsys.readouterr().out
+
+
+def test_only_depth_citations_are_checked():
+    checked = []
+
+    async def fake(prompt, schema, **kw):
+        if "Synthesize" in prompt:
+            return _brief_with_sources("http://a", "http://b", "http://c")
+        if "actually support" in prompt:
+            checked.append(prompt)
+            return {"supported": True, "reason": "ok"}
+        return {"findings": []}
+
+    with patched(research, "ask", fake):
+        out = asyncio.run(research.research("q", depth=1))
+    assert len(checked) == 1 and out["verified"] == 1
