@@ -31,3 +31,5 @@ htmlcov/
 # A stray "~" directory means the cache default lost its expanduser() — check
 # orch.py's CACHE and RUN_LOG paths before deleting anything here.
 ~/
+# Private local workflows
+appear/
