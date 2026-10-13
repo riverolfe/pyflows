@@ -341,12 +341,15 @@ def cache_key(
     cwd: str = ".",
     depends_on: str = "",
     extensions: str = "",
+    reads: str = "",
 ) -> str:
     # Explicit fields, not a merged tuple — a system prompt concatenated onto
     # tools can collide with a different tools tuple.
     fields = [prompt, schema, sorted(tools), system, cwd, depends_on]
     if extensions:
         fields.append(extensions)
+    if reads:
+        fields.append(["reads", reads])
     blob = json.dumps(fields, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
@@ -632,6 +635,7 @@ async def ask(
     depends_on: str | Path | None = None,
     max_budget_usd: float | None = None,
     ext: Extensions = NO_EXTENSIONS,
+    reads: tuple[str | Path, ...] = (),
 ) -> Any | None:
     """One agent call. Returns output that validates against `schema`, else None.
 
@@ -659,8 +663,12 @@ async def ask(
     a symlink. Web tools are not confined: an agent given WebFetch can still
     send what it read under `cwd` to a URL. No MCP servers are loaded, the
     user's own included, and no settings, skills or plugins. `ext` grants them.
+
+    `reads` grants extra read-only roots. Their contents are not fingerprinted;
+    put a digest of what matters in the prompt.
     """
     ext_fields, ext_tools, ext_reads = _extension_options(ext)
+    extra_reads = tuple(Path(r).expanduser().resolve() for r in reads)
     label = STATS.unique(label)
     key = cache_key(
         prompt,
@@ -670,6 +678,7 @@ async def ask(
         str(cwd),
         stat_signature(depends_on) if depends_on else "",
         ext.key(),
+        json.dumps(sorted(str(r) for r in extra_reads)) if extra_reads else "",
     )
     hit = _cache_get(key, label) if use_cache else None
     if hit is not None:
@@ -697,7 +706,10 @@ async def ask(
         **ext_fields,
         hooks={
             "PreToolUse": [
-                HookMatcher(matcher="|".join(PATH_TOOLS), hooks=[_confine(Path(root), ext_reads)])
+                HookMatcher(
+                    matcher="|".join(PATH_TOOLS),
+                    hooks=[_confine(Path(root), (*ext_reads, *extra_reads))],
+                )
             ]
         },
     )

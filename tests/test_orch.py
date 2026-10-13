@@ -113,6 +113,42 @@ def test_confinement_allows_everything_inside_cwd(tmp_path):
         assert _hook_decision(root, tool, tool_input) == "allow", (tool, tool_input)
 
 
+def test_confinement_allows_granted_read_roots_and_nothing_else(tmp_path):
+    root = (tmp_path / "repo").resolve()
+    extra = (tmp_path / "evidence").resolve()
+    root.mkdir()
+    extra.mkdir()
+    hook = orch._confine(root, (extra,))
+
+    def decision(tool, tool_input):
+        out = asyncio.run(hook({"tool_name": tool, "tool_input": tool_input}, None, None))
+        return out.get("hookSpecificOutput", {}).get("permissionDecision", "allow")
+
+    assert decision("Read", {"file_path": str(extra / "trace.log")}) == "allow"
+    assert decision("Grep", {"pattern": "x", "path": str(extra)}) == "allow"
+    assert decision("Read", {"file_path": "../evidence/trace.log"}) == "allow"
+    assert decision("Read", {"file_path": str(tmp_path / "secret.env")}) == "deny"
+    assert decision("Read", {"file_path": "../evidence/../secret.env"}) == "deny"
+
+
+def test_ask_passes_reads_to_the_confinement_hook(tmp_path):
+    captured = {}
+
+    async def fake_run(prompt, options):
+        captured["options"] = options
+        raise RuntimeError("stop here — we only inspect the options")
+
+    extra = tmp_path / "evidence"
+    extra.mkdir()
+    with patched(orch, "_run", fake_run):
+        asyncio.run(orch.ask("p", {"type": "object"}, use_cache=False, reads=(extra,)))
+
+    (matcher,) = captured["options"].hooks["PreToolUse"]
+    (hook,) = matcher.hooks
+    probe = {"tool_name": "Read", "tool_input": {"file_path": str(extra / "a.log")}}
+    assert asyncio.run(hook(probe, None, None)) == {}
+
+
 def test_ask_installs_the_confinement_hook_for_every_path_tool():
     captured = {}
 
@@ -160,6 +196,8 @@ def test_cache_key_separates_every_input_it_is_built_from():
     assert cache_key(*base, "") != cache_key("p", {"t": 1}, ("", "Read"))
     assert cache_key("p", {"t": 1}, ("Read",), "s1") != cache_key("p", {"t": 1}, ("Read",), "s2")
     assert cache_key("p", {"t": 1}, ("Read",)) == cache_key("p", {"t": 1}, ("Read",))
+    assert cache_key(*base, reads='["/a"]') != cache_key(*base, reads='["/b"]')
+    assert cache_key(*base, reads='["/a"]') != cache_key(*base)
 
 
 def test_stat_signature_catches_an_edit_the_clock_did_not_see(tmp_path):
