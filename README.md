@@ -287,6 +287,10 @@ These are the rules the tests exist to protect. Each one is a bug that shipped.
   repo whose `.claude/settings.local.json` allowed `WebSearch`: a
   Read/Grep/Glob agent ran a web search and saw about 110 skills. With no
   sources, the search was denied and only built-in skills were listed.)
+- **Extra read roots are granted per call.** `ask(..., reads=(path, ...))`
+  lets Read, Grep and Glob reach those directories as well as `cwd`. They are
+  part of the cache key by path, not by content: put a digest of what matters
+  in the prompt.
 - **Skills, plugins and MCP servers are granted per workflow, by name.**
   `ask(..., ext=Extensions(skills=..., plugins=..., mcp=...))`, or `--skill`,
   `--plugin` and `--mcp-config` on the CLI. A plugin's own MCP servers are not
