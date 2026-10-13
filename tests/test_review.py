@@ -250,3 +250,87 @@ def test_lens_picks_lenses_by_name_and_lenses_caps_them(tmp_path):
 def test_an_unknown_lens_is_refused(tmp_path):
     with pytest.raises(SystemExit):
         cr.main(["review", str(tmp_path), "--lens", "style"])
+
+
+def _recording(prompts, finding=None):
+    async def fake(prompt, schema, **kw):
+        prompts.append((prompt, kw))
+        if "REFUTE" in prompt:
+            n = len([line for line in prompt.splitlines() if line.startswith("[")])
+            return {
+                "verdicts": [{"index": i, "refuted": False, "reason": "holds"} for i in range(n)]
+            }
+        return {"findings": [finding or FINDING]}
+
+    return fake
+
+
+def test_test_quality_runs_only_when_named(tmp_path):
+    prompts = []
+    with patched(cr, "ask", _recording(prompts)):
+        cr.main(["review", str(tmp_path)])
+        cr.main(["review", str(tmp_path), "--lenses", "4"])
+    finders = [kw["label"] for p, kw in prompts if "REFUTE" not in p]
+    assert finders and not any("test-quality" in label for label in finders)
+    assert all("Claims marked [test-quality]" not in p for p, _ in prompts)
+
+
+def test_test_quality_finder_gets_its_focus_and_keeps_the_order_given(tmp_path):
+    prompts = []
+    argv = [
+        "review",
+        str(tmp_path),
+        "--lens",
+        "test-quality",
+        "--lens",
+        "correctness",
+        "--lenses",
+        "1",
+    ]
+    with patched(cr, "ask", _recording(prompts)):
+        cr.main(argv)
+    (finder,) = [(p, kw) for p, kw in prompts if "REFUTE" not in p]
+    assert finder[1]["label"] == "find/test-quality"
+    assert "missing coverage" in finder[0] and "cannot fail" in finder[0]
+
+
+def test_default_prompts_are_unchanged_by_the_opt_in_lens():
+    finding = {**FINDING, "lens": "correctness"}
+    assert cr._finder_prompt("src", "correctness") == (
+        "Review src for correctness problems. Report only defects you can "
+        "point at in a specific file and line."
+    )
+    assert cr._refute_prompt("src", [finding]) == (
+        "Try to REFUTE each claim about src. Read the actual code once, then judge every claim.\n\n"
+        f"[0] {FINDING['file']}:{FINDING['line']} — {FINDING['summary']}\n"
+        f"    Failure it would cause: {FINDING['failure']}"
+        "\n\nDefault to refuted=true if the code does not back a claim up. "
+        "Return one verdict per index, 1 in total."
+    )
+
+
+def test_test_quality_claims_get_their_refutation_rules():
+    tq = {**FINDING, "lens": "test-quality"}
+    prompt = cr._refute_prompt("src", [{**FINDING, "lens": "correctness"}, tq])
+    assert f"[1] [test-quality] {FINDING['file']}" in prompt
+    assert "name a code change that would make it fail" in prompt
+    assert prompt.count("Claims marked [test-quality]") == 1
+
+
+def test_a_coverage_gap_and_a_bug_on_the_same_line_are_both_verified(tmp_path, capsys):
+    prompts = []
+
+    async def fake(prompt, schema, **kw):
+        prompts.append(prompt)
+        if "REFUTE" in prompt:
+            n = len([line for line in prompt.splitlines() if line.startswith("[")])
+            return {
+                "verdicts": [{"index": i, "refuted": False, "reason": "holds"} for i in range(n)]
+            }
+        return {"findings": [FINDING]}
+
+    with patched(cr, "ask", fake):
+        code = cr.main(["review", str(tmp_path), "--lens", "correctness", "--lens", "test-quality"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "2 confirmed" in out and f"[test-quality] {FINDING['file']}:{FINDING['line']}" in out
