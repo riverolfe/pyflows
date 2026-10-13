@@ -84,9 +84,73 @@ QUICK_LENSES = ("correctness",)
 
 LENSES = ("correctness", "security", "performance", "error-handling")
 
+# Run only when named with --lens.
+OPT_IN_LENSES = ("test-quality",)
 
-def _key(f: dict) -> tuple[str, int]:
+# Extra finder instructions, appended for lenses that have them.
+LENS_FOCUS = {
+    "test-quality": (
+        "Review the tests and what they leave uncovered. Report:\n"
+        "- tests that cannot fail: no assertion, assertions on a fake or mock instead of the "
+        "code, tautologies, exceptions swallowed around the call under test;\n"
+        "- tests that pass for the wrong reason: wrong fixture, a patched target that is never "
+        "called, dependence on test order or shared state, sleeps standing in for "
+        "synchronisation;\n"
+        "- flakiness sources: wall clock, unseeded randomness, network, real paths under ~;\n"
+        "- missing coverage: behaviour no test would catch if it were removed or broken. Point "
+        "at the untested code's file and line, not at a test file.\n"
+        "No style, naming or test-count findings."
+    ),
+}
+
+# Extra refutation rules, added to a verify batch holding findings from these lenses.
+LENS_REFUTE = {
+    "test-quality": (
+        "Claims marked [test-quality] are about tests. You cannot run them; judge by reading. "
+        "A claim that a test cannot fail is refuted if you can name a code change that would "
+        "make it fail. A claim that behaviour is uncovered is refuted if you find a test that "
+        "exercises it and asserts on its result."
+    ),
+}
+
+
+def _key(f: dict) -> tuple:
+    if f.get("lens") in OPT_IN_LENSES:
+        return (f["file"], f["line"], f["lens"])
     return (f["file"], f["line"])
+
+
+def _finder_prompt(target: str, lens: str) -> str:
+    prompt = (
+        f"Review {target} for {lens} problems. Report only defects you can "
+        f"point at in a specific file and line."
+    )
+    focus = LENS_FOCUS.get(lens)
+    return f"{prompt}\n\n{focus}" if focus else prompt
+
+
+def _claim(i: int, f: dict) -> str:
+    tag = f"[{f['lens']}] " if f.get("lens") in LENS_REFUTE else ""
+    return (
+        f"[{i}] {tag}{f['file']}:{f['line']} — {f['summary']}\n"
+        f"    Failure it would cause: {f['failure']}"
+    )
+
+
+def _refute_prompt(target: str, batch: list[dict]) -> str:
+    rules = [
+        LENS_REFUTE[lens]
+        for lens in dict.fromkeys(f.get("lens") for f in batch)
+        if lens in LENS_REFUTE
+    ]
+    return (
+        "Try to REFUTE each claim about "
+        f"{target}. Read the actual code once, then judge every claim.\n\n"
+        + "\n\n".join(_claim(i, f) for i, f in enumerate(batch))
+        + "\n\nDefault to refuted=true if the code does not back a claim up. "
+        f"Return one verdict per index, {len(batch)} in total."
+        + "".join(f"\n\n{rule}" for rule in rules)
+    )
 
 
 class ReviewFailed(RuntimeError):
@@ -116,8 +180,7 @@ async def review(
     found = await gather(
         [
             ask(
-                f"Review {target} for {lens} problems. Report only defects you can "
-                f"point at in a specific file and line.",
+                _finder_prompt(target, lens),
                 FINDINGS,
                 spend=spend,
                 ext=ext,
@@ -132,7 +195,11 @@ async def review(
 
     # A dead lens and a lens that found nothing are both None/{} here — count
     # the dead ones, or "reviewed nothing" reads as "found nothing".
-    alive = [g for g in found if g is not None]
+    alive = [
+        {**g, "findings": [{**f, "lens": lens} for f in g.get("findings", [])]}
+        for lens, g in zip(lenses, found, strict=True)
+        if g is not None
+    ]
     if not alive:
         raise ReviewFailed(f"all {len(lenses)} lenses failed")
 
@@ -156,15 +223,7 @@ async def review(
     results = await gather(
         [
             ask(
-                "Try to REFUTE each claim about "
-                f"{target}. Read the actual code once, then judge every claim.\n\n"
-                + "\n\n".join(
-                    f"[{i}] {f['file']}:{f['line']} — {f['summary']}\n"
-                    f"    Failure it would cause: {f['failure']}"
-                    for i, f in enumerate(batch)
-                )
-                + "\n\nDefault to refuted=true if the code does not back a claim up. "
-                f"Return one verdict per index, {len(batch)} in total.",
+                _refute_prompt(target, batch),
                 BATCH,
                 tools=("Read", "Grep"),
                 spend=spend,
@@ -220,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
     rev.add_argument(
         "--lens",
         action="append",
-        choices=LENSES,
+        choices=LENSES + OPT_IN_LENSES,
         default=None,
         help="run this lens (repeatable); --lenses then caps the chosen list",
     )
@@ -314,7 +373,8 @@ def main(argv: list[str] | None = None) -> int:
 
     confirmed, unconfirmed, dead = result["confirmed"], result["unconfirmed"], result["dead"]
     for f in confirmed:
-        print(f"\n{f['file']}:{f['line']}  {f['summary']}\n  {f['reason']}")
+        tag = f"[{f['lens']}] " if f.get("lens") in OPT_IN_LENSES else ""
+        print(f"\n{tag}{f['file']}:{f['line']}  {f['summary']}\n  {f['reason']}")
     print(f"\n{len(confirmed)} confirmed" if confirmed else "nothing survived verification")
     if unconfirmed:
         print(f"{unconfirmed} findings NOT verified — this review is partial, not clean")

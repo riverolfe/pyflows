@@ -41,6 +41,7 @@ pyflows review src              # 4 lenses, batched verification
 pyflows review src --quick      # 1 lens, 1 verifier — ~4× cheaper
 pyflows review src --lenses 2   # middle ground
 pyflows review src --lens performance --lens error-handling   # pick lenses by name
+pyflows review src --lens test-quality   # opt-in: weak tests and missing coverage
 
 pyflows research "your question"           # multi-modal sweep → synthesize → verify
 pyflows research "q" --angles 2 --depth 3  # fewer angles, more citations checked
@@ -418,6 +419,8 @@ run `pytest`, which uses fakes.
 - `MAX_CALLS = 40` is a guess at a subscription budget, not a measured limit.
 - `max_budget_usd` is checked by the CLI *between turns*, so it overshoots by up
   to one turn's cost — a $0.01 ceiling came back at $0.0322.
+- The `test-quality` lens judges tests by reading them; nothing runs them. A "this test
+  cannot fail" claim survives on reasoning, not on a mutation run.
 - `--quick` gives up independent lenses. Cheap, but a finding then survives on
   one refutation attempt rather than four opinions disagreeing.
 - Research verification checks the first `--depth` sources, which is an
