@@ -22,13 +22,17 @@ def test_agents_command_renders_a_run(capsys):
         }
     )
     orch._log_run({"label": "verify/a.py:3", "outcome": "failed"})
+    orch._log_run(
+        {"label": "find/security", "outcome": "ok", "input": 3000, "output": 10, "seconds": 1.0}
+    )
+    orch._log_run({"label": "find/perf", "outcome": "cache_hit"})
     assert cr.main(["agents"]) == 0
 
     out = capsys.readouterr().out
     assert "src" in out and "quick" in out
     assert "find/correctness" in out
     assert "FAIL" in out and "1 failed" in out
-    assert "12.0k" in out, out
+    assert "1 cached" in out and "15.0k input tokens" in out, out
 
 
 def test_started_without_a_terminal_record_shows_running():
@@ -172,3 +176,15 @@ def test_render_strips_terminal_control_characters():
     )
     assert "\x1b" not in out, repr(out)
     assert "dep/[31mevil row" in out, repr(out)
+
+
+def test_agents_last_shows_only_the_newest_runs(capsys):
+    for target in ("older-run", "middle-run", "newest-run"):
+        orch._log_run({"outcome": "run_start", "target": target, "mode": "full", "lenses": 1})
+        orch._log_run({"label": "find/correctness", "outcome": "ok"})
+    assert cr.main(["agents", "--last", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "newest-run" in out and "middle-run" not in out and "older-run" not in out
+    assert cr.main(["agents", "--last", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "middle-run" in out and "older-run" not in out

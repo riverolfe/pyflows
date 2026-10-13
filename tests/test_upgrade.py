@@ -518,3 +518,27 @@ def test_a_break_without_a_url_is_unconfirmed_not_dropped(tmp_path):
         code = up.main([str(tmp_path), "--limit", "1"])
     assert [e["why"] for e in out["unconfirmed"]] == ["no changelog URL"], out
     assert code == 1
+
+
+def test_the_budget_cut_audits_only_what_fits():
+    many = [{"name": f"p{i:02d}", "current": "1", "direct": True, "uses": i} for i in range(40)]
+    audited = []
+
+    async def fake(prompt, schema, **kw):
+        if "manifest" in prompt:
+            return {"manifest": "package.json", "dependencies": many}
+        audited.append(prompt)
+        return {"findings": [], "sources_checked": ["https://example.com/changelog"]}
+
+    with patched(up, "ask", fake):
+        out = asyncio.run(up.upgrade(".", verify=False))
+    room = orch.MAX_CALLS // 2
+    assert len(audited) == room
+    assert out["skipped"] == 40 - room
+
+
+def test_pick_breaks_ties_by_name():
+    deps = [
+        {"name": n, "current": "1", "direct": True, "uses": 5} for n in ("zeta", "alpha", "mid")
+    ]
+    assert [d["name"] for d in up._pick(deps, None)] == ["alpha", "mid", "zeta"]
