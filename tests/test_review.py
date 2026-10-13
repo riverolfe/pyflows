@@ -207,3 +207,46 @@ def test_the_cli_forwards_extension_flags_to_every_workflow(monkeypatch):
     cr.main(["decide", "q", "a", "b", *flags])
     for name in ("research", "upgrade", "decide"):
         assert got[name][-len(flags) :] == flags, (name, got[name])
+
+
+def test_lens_picks_lenses_by_name_and_lenses_caps_them(tmp_path):
+    systems = []
+
+    async def fake(prompt, schema, **kw):
+        if "REFUTE" not in prompt:
+            systems.append(kw["system"])
+        return {"findings": []}
+
+    with patched(cr, "ask", fake):
+        assert (
+            cr.main(["review", str(tmp_path), "--lens", "performance", "--lens", "error-handling"])
+            == 0
+        )
+        picked = list(systems)
+        systems.clear()
+        assert (
+            cr.main(
+                [
+                    "review",
+                    str(tmp_path),
+                    "--lens",
+                    "security",
+                    "--lens",
+                    "performance",
+                    "--lenses",
+                    "1",
+                ]
+            )
+            == 0
+        )
+
+    assert [s.split(" for ")[1].split(" defects")[0] for s in picked] == [
+        "performance",
+        "error-handling",
+    ]
+    assert len(systems) == 1 and "security" in systems[0]
+
+
+def test_an_unknown_lens_is_refused(tmp_path):
+    with pytest.raises(SystemExit):
+        cr.main(["review", str(tmp_path), "--lens", "style"])
