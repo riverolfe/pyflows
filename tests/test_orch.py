@@ -12,12 +12,30 @@ import pyflows.panel as panel
 from conftest import message, patched
 from pyflows.orch import (
     BudgetExhausted,
+    SeamError,
     _Spend,
     cache_key,
     gather,
+    guard,
     read_runs,
     stat_signature,
 )
+
+# The producer's contract, checked where the consumer reads it.
+FINDINGS = {
+    "type": "object",
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"claim": {"type": "string"}, "url": {"type": "string"}},
+                "required": ["claim", "url"],
+            },
+        }
+    },
+    "required": ["findings"],
+}
 
 
 def test_gather_keeps_good_results_when_others_die():
@@ -879,3 +897,15 @@ def test_read_runs_splits_at_each_run_start():
     runs = orch.read_runs()
     assert [r[0]["target"] for r in runs] == ["first", "second", "third"]
     assert all(len(r) == 2 for r in runs)
+
+
+def test_guard_returns_the_payload_when_it_matches_the_producers_schema():
+    group = {"findings": [{"claim": "x is true", "url": "https://e/x"}]}
+    assert guard(group, FINDINGS, "synthesize") is group
+
+
+def test_guard_raises_at_the_seam_instead_of_letting_a_missing_key_pass():
+    # What research.py saw: a finding with no url, which downstream reads as
+    # f.get("url") -> None and drops silently.
+    with pytest.raises(SeamError, match="synthesize.*findings"):
+        guard({"findings": [{"claim": "x is true"}]}, FINDINGS, "synthesize")
