@@ -112,6 +112,15 @@ class ExtensionError(ValueError):
     """A granted skill, plugin or MCP config that does not exist or will not load."""
 
 
+class SeamError(ValueError):
+    """A stage received input that does not satisfy its producer's schema.
+
+    ask() validates what a stage returns; nothing validated what the *next*
+    stage receives. A missing key there becomes a None three lines downstream,
+    which is the silent-drop failure this raises instead.
+    """
+
+
 class Stats:
     """Live accounting for a run. Process-global; reset with reset()."""
 
@@ -826,6 +835,20 @@ def _schema_error(data: Any, schema: dict) -> str | None:
     except jsonschema.ValidationError as e:
         return f"{'.'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}"
     return None
+
+
+def guard(data: Any, schema: dict, label: str) -> Any:
+    """Input guardrail. Raises SeamError if `data` fails the producer's schema.
+
+    Call this where one stage consumes another's output. Same validator ask()
+    uses, so a payload is judged by one rule at both ends of the handoff.
+
+    ponytail: duplication until a stage has a second reader. That is the point
+    to call it — not before.
+    """
+    if (bad := _schema_error(data, schema)) is not None:
+        raise SeamError(f"stage {label!r} received malformed input: {bad}")
+    return data
 
 
 async def _run(prompt: str, options: ClaudeAgentOptions) -> ResultMessage:
