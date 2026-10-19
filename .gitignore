@@ -32,5 +32,4 @@ htmlcov/
 # orch.py's CACHE and RUN_LOG paths before deleting anything here.
 ~/
 # Private local workflows
-appear/
-night/
+custom/
