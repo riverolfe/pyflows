@@ -151,8 +151,14 @@ async def research(
     depth: int = 3,
     verify: bool = True,
     ext: Extensions = NO_EXTENSIONS,
+    synth: str | None = None,
 ) -> dict:
-    """Research a question. Returns the brief plus a verification summary."""
+    """Research a question. Returns the brief plus a verification summary.
+
+    `synth` overrides the synthesizer's system prompt. That prompt is the one
+    lever research's own citation check grades: claim/URL pairs that survive
+    verification are exactly what a better synthesizer writes.
+    """
     spend = _Spend(MAX_CALLS)
     started = time.monotonic()
 
@@ -213,7 +219,7 @@ async def research(
         spend=spend,
         ext=ext,
         label="synthesize",
-        system="You synthesize. Report disagreement rather than resolving it.",
+        system=synth or "You synthesize. Report disagreement rather than resolving it.",
     )
     if brief is None:
         raise ResearchFailed("synthesis failed")

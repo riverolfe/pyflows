@@ -200,7 +200,7 @@ Two framework modules and four examples:
 
 | | |
 |---|---|
-| `orch.py` | `ask()` — one agent call, output validated against a JSON Schema else `None`. `gather()` — dead stage → `None`, blown budget still stops the run. `stat_signature()` — fingerprints a source tree into the cache key. Plus `CACHE` (diskcache, so a re-run costs nothing), `GATE` (8-deep semaphore — each call is a CLI subprocess), `STATS`, and the run log. |
+| `orch.py` | `ask()` — one agent call, output validated against a JSON Schema else `None`. `gather()` — dead stage → `None`, blown budget still stops the run. `stat_signature()` — fingerprints a source tree into the cache key. Plus `CACHE` (diskcache, so a re-run costs nothing), `GATE` (8-deep semaphore — each call is a CLI subprocess), `STATS`, and the run log. `ask()` takes `model=` and `effort=` for the one call, and `ext=` to grant skills, plugins and MCP servers. |
 | `panel.py` | `agents` and `watch` — renders the run log. Knows nothing about any workflow, so any new one is observable for free. |
 | `examples/review.py` | find → dedup → refute, plus the CLI dispatcher (it is the workflow that dispatches to) |
 | `examples/research.py` | sweep → synthesize → verify |
@@ -221,6 +221,12 @@ a judge from picking on position (which is one `zlib.crc32` sort).
 Two ceilings, not one: `_Spend` bounds *calls* across a run, `max_budget_usd`
 bounds *dollars* within a call. The second catches the runaway single agent the
 first cannot see.
+
+One guardrail, and it fails closed. `ask()` confines every Read, Grep and Glob
+to the working directory with a `PreToolUse` hook; the hook is registered with
+`on_failure="block"`, so a hook that raises stops the read instead of passing
+it through. A broken guardrail that waves the read through is worse than no
+guardrail at all.
 
 ## Invariants
 
@@ -245,6 +251,12 @@ These are the rules the tests exist to protect. Each one is a bug that shipped.
   zero findings means zero verifier batches, not that every batch died.
 - **A dead stage is `None`, a blown budget is an exception.** Exhausting
   `MAX_CALLS` must stop the run, not truncate it into a short result.
+- **A granted extension that did not load is an error, not a missing finding.**
+  An MCP server that fails to connect, a plugin with a broken manifest, a skill
+  the CLI cannot see: the agent works without the tool it was given and reports
+  "nothing found". The CLI's init frame says what it actually loaded, so
+  `ask()` checks it and raises `ExtensionError` — the same rule as the web tool
+  above, one layer down.
 - **A budget stop is not a dead stage.** The CLI enforces `max_budget_usd`
   between turns and returns a well-formed `ResultMessage` with
   `is_error=True` and no `structured_output` — byte-identical to a dead agent.
@@ -400,6 +412,10 @@ run `pytest`, which uses fakes.
   `cwd` is readable, `.env` files included, and an agent that also holds
   `WebFetch` (every `upgrade` agent) can still send what it read to a URL.
   Point `upgrade` only at repos you trust.
+- A denied read ends the stage, not just the tool call: the CLI exits 1 on the
+  denial and the SDK raises. Measured on 2.1.294 and on 2.1.321 alike, so it is
+  the shape of the boundary, not a version quirk — but it means an agent that
+  reaches outside `cwd` costs the stage, not just the read.
 - Agents can start subagents with `Agent`, even though it is not in `tools`. A
   subagent stays under the same confinement hook (measured: a subagent's Glob
   outside `cwd` was denied), but each one is another model call that

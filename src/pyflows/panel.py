@@ -24,6 +24,7 @@ OUTCOMES = {
     "invalid": ("FAIL", "never produced schema-valid output"),
     "no_output": ("FAIL", "returned no structured output"),
     "over_budget": ("BUDGET", "hit its per-call USD ceiling"),
+    "extension_error": ("FAIL", "a granted extension did not load"),
 }
 
 

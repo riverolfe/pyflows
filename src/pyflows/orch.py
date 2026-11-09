@@ -23,7 +23,7 @@ from typing import Any
 
 import diskcache
 import jsonschema
-from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, ResultMessage, query
+from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, ResultMessage, SystemMessage, query
 
 # Each query() spawns a CLI subprocess. Without this cap, fan-out is unbounded.
 GATE = asyncio.Semaphore(8)
@@ -31,6 +31,10 @@ GATE = asyncio.Semaphore(8)
 # Subscription ceiling. A dead agent returns None rather than raising, so a
 # failed stage costs one slot, not the round.
 MAX_CALLS = 40
+
+# How hard the model thinks. The CLI's own levels; anything else is rejected
+# here, where the message can name the field, rather than by the CLI.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
 CACHE_DEFAULT = "~/.cache/pyflows"
 # Deliberately NOT inside the cache dir — `rm -rf ~/.cache/pyflows` is how you
@@ -351,6 +355,8 @@ def cache_key(
     depends_on: str = "",
     extensions: str = "",
     reads: str = "",
+    model: str = "",
+    effort: str = "",
 ) -> str:
     # Explicit fields, not a merged tuple — a system prompt concatenated onto
     # tools can collide with a different tools tuple.
@@ -359,6 +365,13 @@ def cache_key(
         fields.append(extensions)
     if reads:
         fields.append(["reads", reads])
+    # The model and the effort are part of the answer: the same prompt on a
+    # different model is a different answer, and the cache must not serve one
+    # for the other.
+    if model:
+        fields.append(["model", model])
+    if effort:
+        fields.append(["effort", effort])
     blob = json.dumps(fields, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
@@ -645,6 +658,8 @@ async def ask(
     max_budget_usd: float | None = None,
     ext: Extensions = NO_EXTENSIONS,
     reads: tuple[str | Path, ...] = (),
+    model: str | None = None,
+    effort: str | None = None,
 ) -> Any | None:
     """One agent call. Returns output that validates against `schema`, else None.
 
@@ -675,7 +690,13 @@ async def ask(
 
     `reads` grants extra read-only roots. Their contents are not fingerprinted;
     put a digest of what matters in the prompt.
+
+    `model` and `effort` pick the model for this one call and how hard it
+    thinks ("low", "medium", "high", "xhigh", "max"). Both are part of the
+    cache key: the same prompt on a different model is a different answer.
     """
+    if effort is not None and effort not in EFFORT_LEVELS:
+        raise ValueError(f"effort must be one of {', '.join(EFFORT_LEVELS)}, got {effort!r}")
     ext_fields, ext_tools, ext_reads = _extension_options(ext)
     extra_reads = tuple(Path(r).expanduser().resolve() for r in reads)
     label = STATS.unique(label)
@@ -688,6 +709,8 @@ async def ask(
         stat_signature(depends_on) if depends_on else "",
         ext.key(),
         json.dumps(sorted(str(r) for r in extra_reads)) if extra_reads else "",
+        model or "",
+        effort or "",
     )
     hit = _cache_get(key, label) if use_cache else None
     if hit is not None:
@@ -711,6 +734,8 @@ async def ask(
         cwd=root,
         permission_mode="dontAsk",
         max_budget_usd=max_budget_usd,
+        model=model,
+        effort=effort,
         # Settings, skills, plugins and MCP servers: none unless `ext` grants them.
         **ext_fields,
         hooks={
@@ -718,13 +743,18 @@ async def ask(
                 HookMatcher(
                     matcher="|".join(PATH_TOOLS),
                     hooks=[_confine(Path(root), (*ext_reads, *extra_reads))],
+                    # Fail closed. A hook that raises is a broken guardrail, and
+                    # a broken guardrail must not let the read through: without
+                    # this the CLI treats the failure as "no opinion" and the
+                    # agent reads whatever it was told not to.
+                    on_failure="block",
                 )
             ]
         },
     )
     try:
         async with GATE:
-            result = await _run(prompt, options)
+            result, init = await _run(prompt, options)
     except Exception as exc:  # noqa: BLE001 — a dead stage is None, not a crash
         STATS.dead += 1
         STATS.note(label, "failed")
@@ -739,6 +769,15 @@ async def ask(
     if _over_budget(result):
         STATS.finish(label, "over_budget", usage)
         _raise_budget(result, label, max_budget_usd)
+    # A granted extension that did not load makes the whole stage meaningless:
+    # the agent works without the tool it was given and reports "nothing
+    # found". Loudly, not as a dead stage.
+    try:
+        _check_extensions(ext, init)
+    except ExtensionError:
+        STATS.dead += 1
+        STATS.finish(label, "extension_error", usage)
+        raise
     out = getattr(result, "structured_output", None)
     if out is None:
         STATS.dead += 1
@@ -764,7 +803,7 @@ async def ask(
         )
         try:
             async with GATE:
-                result = await _run(retry_prompt, options)
+                result, init = await _run(retry_prompt, options)
         except Exception as exc:  # noqa: BLE001
             STATS.dead += 1
             STATS.finish(label, "failed_retry", usage, retry=True)
@@ -774,6 +813,12 @@ async def ask(
         if _over_budget(result):
             STATS.finish(label, "over_budget", usage, retry=True)
             _raise_budget(result, f"{label} (retry)", max_budget_usd)
+        try:
+            _check_extensions(ext, init)
+        except ExtensionError:
+            STATS.dead += 1
+            STATS.finish(label, "extension_error", usage, retry=True)
+            raise
         out = getattr(result, "structured_output", None)
         if out is None or (error := _schema_error(out, schema)) is not None:
             STATS.dead += 1
@@ -851,15 +896,67 @@ def guard(data: Any, schema: dict, label: str) -> Any:
     return data
 
 
-async def _run(prompt: str, options: ClaudeAgentOptions) -> ResultMessage:
-    """query() is an async iterator; the structured payload rides the final message."""
+async def _run(prompt: str, options: ClaudeAgentOptions) -> tuple[ResultMessage, dict]:
+    """query() is an async iterator; the structured payload rides the final message.
+
+    Also returns the CLI's init frame: what it actually loaded — MCP servers
+    and their status, the plugins it loaded, the skills it can see. A granted
+    extension that did not load shows up there.
+    """
     result = None
+    init: dict = {}
     async for msg in query(prompt=prompt, options=options):
+        if isinstance(msg, SystemMessage) and msg.subtype == "init":
+            init = msg.data or {}
         if isinstance(msg, ResultMessage):
             result = msg
     if result is None:
         raise RuntimeError("stream ended without a result message")
-    return result
+    return result, init
+
+
+def _check_extensions(ext: Extensions, init: dict) -> None:
+    """Raise ExtensionError if a granted extension did not load.
+
+    The CLI's init frame says what it actually loaded: MCP servers with a
+    status, the plugins it loaded, the skills it can see. A granted server
+    that failed to connect, a plugin with a broken manifest, a skill that is
+    not there — without this check the agent simply does without it and
+    reports "nothing found", which is a silent dependency, not a clean result.
+    """
+    if not init:
+        if ext.skills or ext.plugins or ext.mcp or ext.inherit:
+            raise ExtensionError("CLI did not report its init frame; cannot verify granted extensions")
+        return
+    servers = {s.get("name"): s.get("status") for s in init.get("mcp_servers") or []}
+    for name in ext.mcp:
+        status = servers.get(name)
+        if status != "connected":
+            raise ExtensionError(f"MCP server {name!r} did not load (status {status!r})")
+
+    loaded = {
+        str(Path(p["path"]).resolve())
+        for p in init.get("plugins") or []
+        if p.get("path") and p["path"] != "builtin"
+    }
+    errors = init.get("plugin_errors") or []
+    for plugin in ext.plugins:
+        path = str(Path(plugin).expanduser().resolve())
+        if path in loaded:
+            continue
+        detail = next(
+            (e for e in errors if e.get("path") and str(Path(e["path"]).resolve()) == path), None
+        )
+        reason = detail.get("message") if detail else "the CLI did not load it"
+        raise ExtensionError(f"plugin {path} did not load: {reason}")
+
+    if ext.inherit:
+        return  # inherited skills are named by the CLI, not by us
+    expected = {n for n in ext.skills if ":" in n}
+    expected |= {f"{SHIM_PLUGIN}:{n}" for n in ext.skills if ":" not in n}
+    missing = expected - set(init.get("skills") or [])
+    if missing:
+        raise ExtensionError(f"skills not loaded: {', '.join(sorted(missing))}")
 
 
 async def gather(coros: list[Any]) -> list[Any]:

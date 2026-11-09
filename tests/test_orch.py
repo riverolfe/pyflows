@@ -340,7 +340,7 @@ def test_ask_does_not_serve_a_cached_result_for_changed_sources(tmp_path):
 
     async def counting(prompt, options):
         calls.append(prompt)
-        return message(structured_output={"findings": []})
+        return message(structured_output={"findings": []}), {}
 
     schema = {"type": "object", "required": ["findings"]}
 
@@ -363,7 +363,7 @@ def test_ask_strips_terminal_control_characters_from_model_output():
     # rewrite earlier lines, a bidi override can reverse what a line says.
     # Cleaned once in ask(), cached result included, so no workflow forgets.
     async def hostile(prompt, options):
-        return message(structured_output={"s": ["ok\x1b[2J\r\u202eevil", "line\nnext\tcol"]})
+        return message(structured_output={"s": ["ok\x1b[2J\r\u202eevil", "line\nnext\tcol"]}), {}
 
     with patched(orch, "_run", hostile):
         out = asyncio.run(orch.ask("p", {"type": "object"}))
@@ -381,7 +381,7 @@ def test_ask_returns_none_rather_than_an_invalid_payload():
     # The SDK hands back structured_output unvalidated; an invalid payload used
     # to be indistinguishable from a dead agent.
     async def bad(prompt, options):
-        return message(structured_output={"wrong": "shape"})
+        return message(structured_output={"wrong": "shape"}), {}
 
     schema = {"type": "object", "required": ["a"]}
     with patched(orch, "_run", bad):
@@ -396,7 +396,7 @@ def test_ask_recovers_when_the_retry_is_valid():
     async def bad_then_good(prompt, options):
         calls.append(prompt)
         shape = {"wrong": "shape"} if len(calls) == 1 else {"a": 1}
-        return message(structured_output=shape)
+        return message(structured_output=shape), {}
 
     schema = {"type": "object", "required": ["a"]}
     with patched(orch, "_run", bad_then_good):
@@ -413,7 +413,7 @@ def test_ask_raises_when_a_call_hits_its_usd_ceiling():
     # The message reports actual spend, not the ceiling: the CLI checks between
     # turns and overshoots — $0.01 came back at $0.0322.
     async def over_budget(prompt, options):
-        return message(subtype="error_max_budget_usd", is_error=True, total_cost_usd=0.0322)
+        return message(subtype="error_max_budget_usd", is_error=True, total_cost_usd=0.0322), {}
 
     schema = {"type": "object", "required": ["a"]}
     orch.STATS.reset()
@@ -429,7 +429,7 @@ def test_ask_does_not_raise_on_an_ordinary_error_result():
     # Only the budget subtype escalates. Every other error is still a dead
     # stage: one bad call must not take down a fan-out of seven.
     async def errored(prompt, options):
-        return message(subtype="error_during_execution", is_error=True)
+        return message(subtype="error_during_execution", is_error=True), {}
 
     schema = {"type": "object", "required": ["a"]}
     orch.STATS.reset()
@@ -473,7 +473,7 @@ def test_each_log_record_carries_its_own_calls_usage():
     usage = {"input_tokens": 10_000, "output_tokens": 500, "cache_read_input_tokens": 3}
 
     async def run(prompt, options):
-        return message(structured_output={"a": 1}, usage=usage)
+        return message(structured_output={"a": 1}, usage=usage), {}
 
     orch.STATS.reset()
     with patched(orch, "_run", run):
@@ -501,7 +501,7 @@ def test_every_agent_logs_exactly_one_terminal_record():
         queue = list(replies[label])
 
         async def run(prompt, options, queue=queue):
-            return message(structured_output=queue.pop(0), usage=usage)
+            return message(structured_output=queue.pop(0), usage=usage), {}
 
         with patched(orch, "_run", run):
             asyncio.run(orch.ask("p", schema, use_cache=False, label=label))
@@ -516,7 +516,7 @@ def test_every_agent_logs_exactly_one_terminal_record():
     orch.RUN_LOG.unlink(missing_ok=True)
 
     async def broke(prompt, options):
-        return message(subtype="error_max_budget_usd", is_error=True, usage=usage)
+        return message(subtype="error_max_budget_usd", is_error=True, usage=usage), {}
 
     with patched(orch, "_run", broke), pytest.raises(orch.BudgetExhausted):
         asyncio.run(orch.ask("p", schema, use_cache=False, label="b", max_budget_usd=0.01))
@@ -526,7 +526,7 @@ def test_every_agent_logs_exactly_one_terminal_record():
     orch.RUN_LOG.unlink(missing_ok=True)
 
     async def invalid(prompt, options):
-        return message(structured_output={"wrong": 1}, usage=usage)
+        return message(structured_output={"wrong": 1}, usage=usage), {}
 
     with patched(orch, "_run", invalid), pytest.raises(orch.BudgetExhausted):
         asyncio.run(orch.ask("p", schema, use_cache=False, label="r", spend=orch._Spend(1)))
@@ -587,7 +587,7 @@ def test_ask_logs_a_started_record_before_the_call():
 
     async def watching(prompt, options):
         seen.append(orch.read_runs()[-1][-1].get("outcome") if orch.read_runs() else None)
-        return message(structured_output={"ok": 1})
+        return message(structured_output={"ok": 1}), {}
 
     with patched(orch, "_run", watching):
         asyncio.run(orch.ask("p", {"type": "object"}, use_cache=False, label="find/x"))
@@ -687,7 +687,8 @@ def test_inherit_loads_every_setting_source_including_local():
 
 def test_extensions_are_part_of_the_cache_key():
     async def fake(prompt, options):
-        return message(structured_output={"skills": options.skills})
+        init = {"mcp_servers": [], "plugins": [], "skills": []}
+        return message(structured_output={"skills": options.skills}), init
 
     with patched(orch, "_run", fake):
         bare = asyncio.run(orch.ask("p", {"type": "object"}))
@@ -718,7 +719,7 @@ def test_extension_flags_survive_cli_forwarding(tmp_path):
 
 def test_agents_sharing_a_label_get_distinct_ones():
     async def ok(prompt, options):
-        return message(structured_output={})
+        return message(structured_output={}), {}
 
     with patched(orch, "_run", ok):
         asyncio.run(
@@ -781,7 +782,7 @@ def test_a_stale_shim_link_is_replaced(tmp_path):
 
 def test_cache_failures_warn_and_keep_the_result(capsys):
     async def ok(prompt, options):
-        return message(structured_output={"a": 1})
+        return message(structured_output={"a": 1}), {}
 
     class Broken:
         directory = orch.CACHE.directory
@@ -834,7 +835,7 @@ def test_run_keeps_the_last_result_and_fails_without_one(monkeypatch):
         return query
 
     monkeypatch.setattr(orch, "query", stream("progress", first, "more", last))
-    assert asyncio.run(orch._run("p", cast(Any, None))) is last
+    assert asyncio.run(orch._run("p", cast(Any, None))) == (last, {})
     monkeypatch.setattr(orch, "query", stream("progress"))
     with pytest.raises(RuntimeError, match="without a result message"):
         asyncio.run(orch._run("p", cast(Any, None)))
@@ -846,7 +847,7 @@ def test_a_retry_that_raises_is_a_dead_agent():
     async def bad_then_raise(prompt, options):
         calls.append(prompt)
         if len(calls) == 1:
-            return message(structured_output={"wrong": "shape"})
+            return message(structured_output={"wrong": "shape"}), {}
         raise RuntimeError("connection lost")
 
     schema = {"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]}
@@ -863,8 +864,8 @@ def test_a_retry_over_the_per_call_ceiling_is_budget_exhausted():
     async def bad_then_broke(prompt, options):
         calls.append(prompt)
         if len(calls) == 1:
-            return message(structured_output={"wrong": "shape"})
-        return message(subtype="error_max_budget_usd", is_error=True)
+            return message(structured_output={"wrong": "shape"}), {}
+        return message(subtype="error_max_budget_usd", is_error=True), {}
 
     schema = {"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]}
     with patched(orch, "_run", bad_then_broke), pytest.raises(orch.BudgetExhausted):
@@ -909,3 +910,126 @@ def test_guard_raises_at_the_seam_instead_of_letting_a_missing_key_pass():
     # f.get("url") -> None and drops silently.
     with pytest.raises(SeamError, match="synthesize.*findings"):
         guard({"findings": [{"claim": "x is true"}]}, FINDINGS, "synthesize")
+
+
+def test_the_confinement_hook_fails_closed():
+    # A hook that raises is a broken guardrail. Left as "no opinion" the CLI
+    # waves the read through — the agent reads what it was told not to.
+    captured = {}
+
+    async def fake(prompt, options):
+        captured["options"] = options
+        return message(structured_output={}), {}
+
+    with patched(orch, "_run", fake):
+        asyncio.run(orch.ask("p", {"type": "object"}, use_cache=False))
+    assert captured["options"].hooks["PreToolUse"][0].on_failure == "block"
+
+
+def test_the_model_and_the_effort_reach_the_cli_and_the_cache_key():
+    captured = {}
+
+    async def fake(prompt, options):
+        captured["options"] = options
+        return message(structured_output={}), {}
+
+    with patched(orch, "_run", fake):
+        asyncio.run(
+            orch.ask(
+                "p",
+                {"type": "object"},
+                use_cache=False,
+                model="claude-opus-5-5",
+                effort="high",
+            )
+        )
+    assert captured["options"].model == "claude-opus-5-5"
+    assert captured["options"].effort == "high"
+
+    # The same prompt on another model is another answer: the cache must not
+    # serve one for the other.
+    assert cache_key("p", {}, ("Read",)) != cache_key("p", {}, ("Read",), model="claude-opus-5-5")
+    assert cache_key("p", {}, ("Read",), effort="low") != cache_key("p", {}, ("Read",))
+
+
+def test_an_unknown_effort_is_refused_before_the_call():
+    with pytest.raises(ValueError, match="effort must be one of"):
+        asyncio.run(orch.ask("p", {"type": "object"}, effort="turbo"))
+
+
+def test_a_granted_mcp_server_that_did_not_connect_is_an_error():
+    ext = orch.Extensions(mcp={"crg": {"command": "crg"}})
+    ok = {"mcp_servers": [{"name": "crg", "status": "connected"}], "plugins": [], "skills": []}
+    orch._check_extensions(ext, ok)
+    with pytest.raises(orch.ExtensionError, match="crg.*did not load"):
+        orch._check_extensions(ext, {"mcp_servers": [{"name": "crg", "status": "failed"}]})
+    with pytest.raises(orch.ExtensionError, match="did not report its init frame"):
+        orch._check_extensions(ext, {})
+
+
+def test_a_plugin_that_did_not_load_is_an_error(tmp_path):
+    plugin = tmp_path / "p"
+    (plugin / ".claude-plugin").mkdir(parents=True)
+    (plugin / ".claude-plugin" / "plugin.json").write_text('{"name": "p"}')
+    ext = orch.Extensions(plugins=(str(plugin),))
+    loaded = {"plugins": [{"name": "p", "path": str(plugin)}], "skills": []}
+    orch._check_extensions(ext, loaded)
+    broken = {
+        "plugins": [],
+        "plugin_errors": [
+            {"plugin": "inline[0]", "type": "generic-error", "message": "invalid manifest"}
+        ],
+    }
+    with pytest.raises(orch.ExtensionError, match="did not load"):
+        orch._check_extensions(ext, broken)
+
+
+def test_a_skill_that_did_not_load_is_an_error():
+    ext = orch.Extensions(skills=("mine",))
+    with pytest.raises(orch.ExtensionError, match="pyflows-user:mine"):
+        orch._check_extensions(ext, {"skills": ["other"], "plugins": []})
+
+
+def test_a_failed_extension_raises_instead_of_reporting_nothing_found(monkeypatch):
+    # The bug this closes: a granted MCP server that fails to connect leaves
+    # the agent working without it, and it reports "nothing found".
+    init = orch.SystemMessage(
+        subtype="init",
+        data={
+            "mcp_servers": [{"name": "crg", "status": "failed"}],
+            "plugins": [],
+            "skills": [],
+        },
+    )
+
+    async def stream(prompt, options):
+        yield init
+        yield message(structured_output={"findings": []})
+
+    monkeypatch.setattr(orch, "query", stream)
+    ext = orch.Extensions(mcp={"crg": {"command": "crg"}})
+    with pytest.raises(orch.ExtensionError):
+        asyncio.run(orch.ask("p", {"type": "object"}, ext=ext, use_cache=False, label="verify/x"))
+    outcomes = [r.get("outcome") for r in map(json.loads, orch.RUN_LOG.read_text().splitlines())]
+    assert outcomes[-1] == "extension_error"
+
+
+def test_a_retry_must_also_report_its_granted_extensions():
+    calls = 0
+    ext = orch.Extensions(mcp={"crg": {"command": "crg"}})
+    connected = {"mcp_servers": [{"name": "crg", "status": "connected"}]}
+    failed = {"mcp_servers": [{"name": "crg", "status": "failed"}]}
+
+    async def retry(prompt, options):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return message(structured_output={"wrong": "shape"}), connected
+        return message(structured_output={"findings": []}), failed
+
+    schema = {"type": "object", "required": ["findings"]}
+    with patched(orch, "_run", retry), pytest.raises(orch.ExtensionError, match="crg.*did not load"):
+        asyncio.run(orch.ask("p", schema, ext=ext, use_cache=False, label="retry-extension"))
+    assert calls == 2
+    outcomes = [r.get("outcome") for r in map(json.loads, orch.RUN_LOG.read_text().splitlines())]
+    assert outcomes[-1] == "extension_error"
