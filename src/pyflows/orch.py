@@ -142,6 +142,8 @@ class Stats:
         self.cost_usd = 0.0
         self.seconds = 0.0
         self.labels: dict[str, int] = {}  # times each label was handed out
+        self.models: dict[str, int] = {}  # calls that used each model
+        self.efforts: set[str] = set()  # effort levels asked for; "default" = not set
 
     def unique(self, label: str) -> str:
         """`label`, or `label#n` for the n-th use of it this run."""
@@ -150,13 +152,22 @@ class Stats:
         n = self.labels[label] = self.labels.get(label, 0) + 1
         return label if n == 1 else f"{label}#{n}"
 
-    def record(self, result: ResultMessage) -> dict:
+    def record(self, result: ResultMessage, effort: str | None = None) -> dict:
         """Add one call's usage to the run totals and return that call's usage.
 
         Does not log: ask() writes one terminal record per agent, carrying the
         usage of its first call plus any retry.
+
+        `models` is what the CLI says it ran (the keys of model_usage), not what
+        was asked for: an unset model resolves to the CLI's default, which no
+        setting here names. `effort` is what was asked for — the CLI does not
+        report it back — and "default" when unset.
         """
         self.agents += 1
+        models = sorted((getattr(result, "model_usage", None) or {}).keys())
+        for m in models:
+            self.models[m] = self.models.get(m, 0) + 1
+        self.efforts.add(effort or "default")
         # duration_api_ms is typed int but the CLI can emit JSON null, and
         # getattr's default does not cover an explicit None.
         secs = (getattr(result, "duration_api_ms", None) or 0) / 1000
@@ -190,6 +201,8 @@ class Stats:
             "cache_write": write,
             "seconds": secs,
             "cost_usd": getattr(result, "total_cost_usd", None) or 0.0,
+            "models": models,
+            "effort": effort or "default",
         }
 
     def note(self, label: str, outcome: str) -> None:
@@ -214,6 +227,8 @@ class Stats:
                 "cache_read": usage["cache_read"],
                 "seconds": round(usage["seconds"], 1),
                 "cost_usd": round(usage["cost_usd"], 4),
+                "models": usage["models"],
+                "effort": usage["effort"],
             }
         )
 
@@ -228,12 +243,22 @@ class Stats:
             f"(fresh in {self.input_tokens / 1e6:.2f}M / out {self.output_tokens / 1e3:.1f}k / "
             f"cache read {self.cache_read / 1e6:.2f}M / write {self.cache_write / 1e6:.2f}M)\n"
             f"cost: ${self.cost_usd:.2f} at API prices\n"
-            f"api time: {self.seconds:.0f}s across {self.agents} agents"
+            f"api time: {self.seconds:.0f}s across {self.agents} agents" + self._models_line()
         )
+
+    def _models_line(self) -> str:
+        if not self.agents:
+            return ""
+        models = ", ".join(f"{m} x{n}" for m, n in sorted(self.models.items())) or "not reported"
+        return f"\nmodels: {models} | effort: {', '.join(sorted(self.efforts))}"
 
 
 def _add_usage(a: dict, b: dict) -> dict:
-    return {k: a[k] + b[k] for k in a}
+    """A call plus its retry: counters add, models union, effort is the same for both."""
+    out = {k: a[k] + b[k] for k in a if k not in ("models", "effort")}
+    out["models"] = sorted({*a["models"], *b["models"]})
+    out["effort"] = a["effort"]
+    return out
 
 
 STATS = Stats()
@@ -761,7 +786,7 @@ async def ask(
         print(f"  stage failed [{label}]: {type(exc).__name__}: {exc}")
         return None
 
-    usage = STATS.record(result)
+    usage = STATS.record(result, effort)
     # Checked before structured_output, because a budget stop arrives as a
     # well-formed ResultMessage with is_error=True and no output — exactly the
     # shape of a dead agent. Counting that as dead makes "ran out of money"
@@ -809,7 +834,7 @@ async def ask(
             STATS.finish(label, "failed_retry", usage, retry=True)
             print(f"  stage failed [{label}] retry: {type(exc).__name__}: {exc}")
             return None
-        usage = _add_usage(usage, STATS.record(result))
+        usage = _add_usage(usage, STATS.record(result, effort))
         if _over_budget(result):
             STATS.finish(label, "over_budget", usage, retry=True)
             _raise_budget(result, f"{label} (retry)", max_budget_usd)
@@ -926,7 +951,9 @@ def _check_extensions(ext: Extensions, init: dict) -> None:
     """
     if not init:
         if ext.skills or ext.plugins or ext.mcp or ext.inherit:
-            raise ExtensionError("CLI did not report its init frame; cannot verify granted extensions")
+            raise ExtensionError(
+                "CLI did not report its init frame; cannot verify granted extensions"
+            )
         return
     servers = {s.get("name"): s.get("status") for s in init.get("mcp_servers") or []}
     for name in ext.mcp:

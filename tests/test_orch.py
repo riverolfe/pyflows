@@ -1028,8 +1028,37 @@ def test_a_retry_must_also_report_its_granted_extensions():
         return message(structured_output={"findings": []}), failed
 
     schema = {"type": "object", "required": ["findings"]}
-    with patched(orch, "_run", retry), pytest.raises(orch.ExtensionError, match="crg.*did not load"):
+    with (
+        patched(orch, "_run", retry),
+        pytest.raises(orch.ExtensionError, match="crg.*did not load"),
+    ):
         asyncio.run(orch.ask("p", schema, ext=ext, use_cache=False, label="retry-extension"))
     assert calls == 2
     outcomes = [r.get("outcome") for r in map(json.loads, orch.RUN_LOG.read_text().splitlines())]
     assert outcomes[-1] == "extension_error"
+
+
+def test_each_record_and_the_summary_name_the_model_and_effort():
+    # Agents load no settings, so an unset model is whatever the CLI defaults
+    # to. The log must say what actually ran, not what was configured.
+    per_model = {"claude-x": {"inputTokens": 1, "outputTokens": 1}}
+    replies = [{"wrong": 1}, {"a": 1}]
+
+    async def run(prompt, options):
+        return message(structured_output=replies.pop(0), model_usage=per_model), {}
+
+    orch.STATS.reset()
+    orch.RUN_LOG.unlink(missing_ok=True)
+    with patched(orch, "_run", run):
+        asyncio.run(
+            orch.ask("p", {"type": "object", "required": ["a"]}, use_cache=False, effort="low")
+        )
+    (done,) = [r for r in _log() if r["outcome"] == "ok"]
+    assert (done["models"], done["effort"], done["retry"]) == (["claude-x"], "low", True)
+    assert "models: claude-x x2 | effort: low" in orch.STATS.summary()
+
+    orch.STATS.reset()
+    orch.STATS.record(message(usage={"input_tokens": 1}))
+    assert "models: not reported | effort: default" in orch.STATS.summary()
+    orch.STATS.reset()
+    assert "models:" not in orch.STATS.summary(), "no agents ran, nothing to name"

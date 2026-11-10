@@ -90,10 +90,8 @@ def _render(run: list[dict]) -> str:
     if mode == "research" and len(target) > 58:
         target = target[:57] + "…"
     rows = _stage_rows(run)
-    lines = [
-        f"{target}  [{mode}{fanout}]",
-        f"{'stage':<{STAGE_COL}} {'status':<8} {'in':>8} {'out':>7} {'sec':>6}",
-    ]
+    header = f"{'stage':<{STAGE_COL}} {'status':<8} {'in':>8} {'out':>7} {'sec':>6}"
+    lines = [f"{target}  [{mode}{fanout}]", header]
     for label, status, tok_in, tok_out, secs in rows:
         label = clean_text(label, newlines=False)
         # Truncate from the left: the tail of a path is the useful half.
@@ -104,12 +102,39 @@ def _render(run: list[dict]) -> str:
     cached = sum(1 for r in run if r.get("outcome") == "cache_hit")
     running = sum(1 for r in rows if r[1] == "running")
     spent = sum(r.get("input", 0) or 0 for r in run)
-    lines.append("-" * 66)
+    # As wide as the rows, whatever STAGE_COL is. A literal width drifted one
+    # column past the rows.
+    lines.append("-" * len(header))
     lines.append(
         f"{len(rows)} stages · {failed} failed · {cached} cached · "
         f"{spent / 1000:.1f}k input tokens" + (f" · {running} running" if running else "")
     )
+    models = _models_line(run)
+    if models:
+        lines.append(models)
     return "\n".join(lines)
+
+
+def _models_line(run: list[dict]) -> str:
+    """What the agents actually ran on, from their terminal records.
+
+    A footer, not a column: a run almost always uses one model throughout, and
+    a column would repeat it on every row. Empty for logs written before
+    records carried models, rather than claiming "not reported" for them.
+    """
+    models: dict[str, int] = {}
+    efforts: set[str] = set()
+    for record in run:
+        if "effort" not in record:
+            continue
+        efforts.add(clean_text(str(record["effort"]), newlines=False))
+        for m in record.get("models") or ():
+            m = clean_text(str(m), newlines=False)
+            models[m] = models.get(m, 0) + 1
+    if not efforts:
+        return ""
+    names = ", ".join(f"{m} x{n}" for m, n in sorted(models.items())) or "not reported"
+    return f"models: {names} · effort: {', '.join(sorted(efforts))}"
 
 
 def show_agents(last: int, as_json: bool = False) -> int:

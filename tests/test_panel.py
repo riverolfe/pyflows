@@ -188,3 +188,31 @@ def test_agents_last_shows_only_the_newest_runs(capsys):
     assert cr.main(["agents", "--last", "2"]) == 0
     out = capsys.readouterr().out
     assert "middle-run" in out and "older-run" not in out
+
+
+def test_the_rule_is_as_wide_as_the_rows_and_the_footer_names_the_models():
+    run = [
+        {"outcome": "run_start", "target": "src", "mode": "triage", "lenses": None},
+        {"label": "quick/a", "outcome": "started"},
+        {
+            "label": "quick/a",
+            "outcome": "ok",
+            "input": 1,
+            "models": ["m-big", "m-small"],
+            "effort": "low",
+        },
+        {"label": "quick/b", "outcome": "started"},
+        {"label": "quick/b", "outcome": "ok", "input": 1, "models": ["m-big"], "effort": "low"},
+        {"label": "quick/c", "outcome": "cache_hit"},
+    ]
+    lines = panel._render(run).splitlines()
+    rule = next(line for line in lines if set(line) == {"-"})
+    assert len(rule) == len(lines[1]), "rule and header differ in width"
+    assert lines[-1] == "models: m-big x2, m-small x1 · effort: low", lines[-1]
+
+    # Logs from before records carried models: no footer, not "not reported".
+    old = [r for r in run if r.get("outcome") != "ok"] + [{"label": "quick/a", "outcome": "ok"}]
+    assert "models:" not in panel._render(old)
+    # A model name is replayed raw from the log: no escape reaches the terminal.
+    evil = [*run[:2], {**run[2], "models": ["m\x1b[2Jx"]}]
+    assert "\x1b" not in panel._render(evil)
