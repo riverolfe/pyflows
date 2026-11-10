@@ -674,7 +674,7 @@ def test_granted_plugins_skills_and_mcp_are_passed_and_allowed(tmp_path):
     assert opts.plugins == [{"type": "local", "path": str(plugin.resolve())}], opts.plugins
     assert opts.skills == ["fw-guru:crg"], opts.skills
     assert opts.mcp_servers == {"crg": server} and opts.strict_mcp_config is True
-    assert "mcp__crg" in opts.allowed_tools, opts.allowed_tools
+    assert "mcp__crg__*" in opts.allowed_tools, opts.allowed_tools
     assert opts.setting_sources == [], opts.setting_sources
 
 
@@ -1062,3 +1062,12 @@ def test_each_record_and_the_summary_name_the_model_and_effort():
     assert "models: not reported | effort: default" in orch.STATS.summary()
     orch.STATS.reset()
     assert "models:" not in orch.STATS.summary(), "no agents ran, nothing to name"
+
+
+def test_an_mcp_server_is_allowed_by_its_whole_name():
+    # Since CLI 2.1.299 an allow-rule reaches only the server it names, so
+    # "mcp__my__server" no longer matches a server called "my__server" — the
+    # call was denied. The wildcard form names the whole server.
+    ext = orch.Extensions(mcp={"my__server": {"command": "x"}})
+    _, allowed, _ = orch._extension_options(ext)
+    assert allowed == ["mcp__my__server__*"]

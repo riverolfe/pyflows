@@ -579,7 +579,11 @@ def _extension_options(ext: Extensions) -> tuple[dict, list[str], tuple[Path, ..
         if not path.is_dir():
             raise ExtensionError(f"no such plugin dir: {p}")
         plugins.append(path)
-    allowed = [f"mcp__{name}" for name in ext.mcp]
+    allowed = [f"mcp__{name}__*" for name in ext.mcp]
+    # "mcp__<name>" is not enough: since CLI 2.1.299 an allow-rule reaches only
+    # the server it names, so a server called "my__server" is no longer matched
+    # by "mcp__my__server" — measured, the call was denied. The wildcard form
+    # names the whole server whatever it is called.
 
     if not ext.inherit:
         by_name = {_plugin_name(p): p for p in plugins}
